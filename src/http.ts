@@ -12,21 +12,18 @@
  *   android-deploy-and-verify  — Atomic: install → launch → check → logcat
  *
  * SECURITY:
- *   - Server-side bearer token validation (crypto.timingSafeEqual)
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
  *   - All inputs validated: package, activity, serial, paths
  *   - execFile used (no shell interpretation)
  *   - Logcat output filtered to crash patterns only
  *   - POST-only on /mcp endpoint
  *
- * Usage: PORT=8912 SECRETS_DIR=/run/secrets bun run src/http.ts
+ * Usage: PORT=8912 bun run src/http.ts
  */
 
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
-import { timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -36,7 +33,6 @@ const execFile = promisify(execFileCb);
 // ── Configuration ──────────────────────────────────────────
 
 const PORT = Number(process.env["PORT"]) || 8912;
-const SECRETS_DIR = process.env["SECRETS_DIR"] || "/run/secrets";
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
 const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/"];
@@ -98,39 +94,6 @@ function validatePullLocalPath(localPath: string): string {
     throw new Error(`Pull destination restricted to: ${ALLOWED_PULL_LOCAL_DIR}`);
   }
   return resolved;
-}
-
-// ── Auth ───────────────────────────────────────────────────
-
-function loadBearerToken(): string {
-  // Deduplicate paths (F15)
-  const paths = [...new Set([
-    resolve(SECRETS_DIR, "mcp-android-token"),
-    "/run/secrets/mcp-android-token",
-  ])];
-  for (const tokenPath of paths) {
-    try {
-      const token = readFileSync(tokenPath, "utf-8").trim();
-      if (token.length > 0) return token;
-    } catch {
-      continue;
-    }
-  }
-  throw new Error("Failed to load bearer token. Check secrets mount.");
-}
-
-const BEARER_TOKEN = loadBearerToken();
-
-// F1: Use crypto.timingSafeEqual for proper constant-time comparison
-function validateAuth(req: Request): boolean {
-  const authHeader = req.headers.get("authorization");
-  if (!authHeader) return false;
-  const parts = authHeader.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") return false;
-  const token = Buffer.from(parts[1]);
-  const expected = Buffer.from(BEARER_TOKEN);
-  if (token.length !== expected.length) return false;
-  return timingSafeEqual(token, expected);
 }
 
 // ── ADB Helpers ────────────────────────────────────────────
@@ -391,10 +354,6 @@ const httpServer = Bun.serve({
       // F16: POST only
       if (req.method !== "POST") {
         return new Response("Method Not Allowed", { status: 405 });
-      }
-
-      if (!validateAuth(req)) {
-        return new Response("Unauthorized", { status: 401 });
       }
 
       if (isRateLimited()) {
