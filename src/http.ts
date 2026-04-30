@@ -13,6 +13,8 @@
  *   android-list-builds        — List APKs/AABs in /data/builds/
  *   android-screenshot         — Capture screenshot from device/emulator
  *   android-build              — Trigger gradle build, output to /data/builds/
+ *   android-list-files         — List files in /data/builds/ (screenshots, APKs)
+ *   android-download           — Download file from /data/builds/ as base64
  *
  * SECURITY:
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
@@ -28,7 +30,8 @@ import { resolve } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdirSync, copyFileSync, realpathSync } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, stat, readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -499,6 +502,104 @@ function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text" as const, text: `Build failed: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
+  // ── Tool: android-list-files ────────────────────────────────
+
+  const MAX_LIST_DEPTH = 2;
+
+  server.tool(
+    "android-list-files",
+    "List files in /data/builds/ (screenshots, APKs, AABs). Optionally filter by subdirectory.",
+    {
+      directory: z
+        .string()
+        .max(200)
+        .default("")
+        .describe("Subdirectory relative to /data/builds/ (e.g., 'screenshots'). Empty = root."),
+    },
+    async ({ directory }) => {
+      try {
+        const base = resolve(ALLOWED_INSTALL_DIR, directory || ".");
+        if (!base.startsWith(ALLOWED_INSTALL_DIR)) {
+          return { content: [{ type: "text" as const, text: "Error: path outside /data/builds/" }] };
+        }
+
+        const entries: string[] = [];
+        async function listDir(dir: string, depth: number): Promise<void> {
+          if (depth > MAX_LIST_DEPTH) return;
+          const items = await readdir(dir).catch(() => [] as string[]);
+          for (const item of items) {
+            const full = resolve(dir, item);
+            if (!full.startsWith(ALLOWED_INSTALL_DIR)) continue;
+            const st = await stat(full).catch(() => null);
+            if (!st) continue;
+            const rel = full.slice(ALLOWED_INSTALL_DIR.length + 1);
+            if (st.isDirectory()) {
+              entries.push(`[dir] ${rel}/`);
+              await listDir(full, depth + 1);
+            } else {
+              const sizeMB = (st.size / 1_048_576).toFixed(2);
+              entries.push(`${rel} (${sizeMB} MB, ${st.mtime.toISOString()})`);
+            }
+          }
+        }
+
+        await listDir(base, 0);
+        if (entries.length === 0) return { content: [{ type: "text" as const, text: "No files found." }] };
+        return { content: [{ type: "text" as const, text: `## /data/builds/${directory || ""}\n${entries.map((e) => `- ${e}`).join("\n")}` }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Error listing files: ${msg.slice(0, 200)}` }] };
+      }
+    },
+  );
+
+  // ── Tool: android-download ────────────────────────────────
+
+  const MAX_DOWNLOAD_BYTES = 10 * 1_048_576; // 10 MB
+
+  server.tool(
+    "android-download",
+    "Download a file from /data/builds/ as base64. Use for transferring screenshots or APKs to other services (e.g., Nextcloud). Max 10MB.",
+    {
+      path: z
+        .string()
+        .min(1)
+        .max(300)
+        .describe("File path relative to /data/builds/ (e.g., 'screenshots/emulator-5556_2026-04-30.png')"),
+    },
+    async ({ path: filePath }) => {
+      try {
+        const full = resolve(ALLOWED_INSTALL_DIR, filePath);
+        if (!full.startsWith(ALLOWED_INSTALL_DIR + "/")) {
+          return { content: [{ type: "text" as const, text: "Error: path outside /data/builds/" }] };
+        }
+
+        const st = await stat(full).catch(() => null);
+        if (!st || !st.isFile()) {
+          return { content: [{ type: "text" as const, text: `Error: file not found: ${filePath}` }] };
+        }
+        if (st.size > MAX_DOWNLOAD_BYTES) {
+          const sizeMB = (st.size / 1_048_576).toFixed(2);
+          return { content: [{ type: "text" as const, text: `Error: file too large (${sizeMB} MB, max 10 MB)` }] };
+        }
+
+        const buf = await readFile(full);
+        const b64 = buf.toString("base64");
+        const name = basename(full);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `## ${name}\n- Size: ${(st.size / 1_048_576).toFixed(2)} MB\n- Base64 length: ${b64.length}\n\n${b64}`,
+          }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Download failed: ${msg.slice(0, 200)}` }] };
       }
     },
   );
