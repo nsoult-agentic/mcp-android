@@ -199,7 +199,7 @@ function createServer(): McpServer {
     async ({ device_serial, package_name }) => {
       validateSerial(device_serial);
       validatePackage(package_name);
-      const result = await adb(device_serial, "shell", "pidof", package_name);
+      const result = await adb(device_serial, "shell", "pidof", package_name).catch(() => "");
       const running = result.length > 0;
       return {
         content: [{
