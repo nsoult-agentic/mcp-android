@@ -10,6 +10,8 @@
  *   android-logcat             — Read logcat (package-filtered, crash patterns)
  *   android-pull               — Pull file from device (path-restricted)
  *   android-deploy-and-verify  — Atomic: install → launch → check → logcat
+ *   android-list-builds        — List APKs/AABs in /data/builds/
+ *   android-screenshot         — Capture screenshot from device/emulator
  *
  * SECURITY:
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
@@ -24,6 +26,8 @@
 import { resolve } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
+import { mkdirSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -35,7 +39,7 @@ const execFile = promisify(execFileCb);
 const PORT = Number(process.env["PORT"]) || 8912;
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
-const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/"];
+const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sdcard/Pictures/", "/sdcard/Screenshots/", "/sdcard/Download/"];
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
 const ADB_TIMEOUT_MS = 15_000;
@@ -258,7 +262,7 @@ function createServer(): McpServer {
   };
   server.tool(
     "android-pull",
-    "Pull a file from the device. Device path restricted to /sdcard/Android/data/ and /data/local/tmp/. Local destination restricted to /data/builds/.",
+    `Pull a file from the device. Device path restricted to: ${ALLOWED_PULL_PREFIXES.join(", ")}. Local destination restricted to /data/builds/.`,
     PullInput,
     async ({ device_serial, device_path, local_path }) => {
       validateSerial(device_serial);
@@ -331,6 +335,84 @@ function createServer(): McpServer {
     },
   );
 
+  // ── Tool: android-list-builds ──────────────────────────────
+
+  server.tool(
+    "android-list-builds",
+    "List available APKs and AABs in /data/builds/. Returns filename, size, and modified date.",
+    {},
+    async () => {
+      try {
+        const entries = await readdir(ALLOWED_INSTALL_DIR);
+        const builds: string[] = [];
+        for (const f of entries) {
+          if (!f.endsWith(".apk") && !f.endsWith(".aab")) continue;
+          const fullPath = resolve(ALLOWED_INSTALL_DIR, f);
+          const st = await stat(fullPath);
+          const sizeMB = (st.size / 1_048_576).toFixed(2);
+          const modified = st.mtime.toISOString();
+          builds.push(`- ${f} (${sizeMB} MB, ${modified})`);
+        }
+
+        if (builds.length === 0) {
+          return { content: [{ type: "text" as const, text: "No APK or AAB files found in /data/builds/" }] };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `## Builds (${builds.length})\n${builds.join("\n")}` }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Error listing builds: ${msg.slice(0, 200)}` }] };
+      }
+    },
+  );
+
+  // ── Tool: android-screenshot ──────────────────────────────
+
+  const SCREENSHOT_DIR = "/data/builds/screenshots";
+
+  server.tool(
+    "android-screenshot",
+    "Capture a screenshot from a device or emulator. Saves to /data/builds/screenshots/ and returns the file path.",
+    {
+      device_serial: z
+        .string()
+        .min(1)
+        .max(64)
+        .describe("Device serial (from android-list-devices)"),
+    },
+    async ({ device_serial }) => {
+      try {
+        validateSerial(device_serial);
+
+        // Ensure screenshot directory exists
+        mkdirSync(SCREENSHOT_DIR, { recursive: true });
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const deviceTag = device_serial.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const remotePath = `/sdcard/screenshot_tmp_${timestamp}.png`;
+        const localFile = `${SCREENSHOT_DIR}/${deviceTag}_${timestamp}.png`;
+
+        // Capture screenshot on device
+        await adb(device_serial, "shell", "screencap", "-p", remotePath);
+
+        // Pull to local
+        await adb(device_serial, "pull", remotePath, localFile);
+
+        // Clean up device temp file
+        await adb(device_serial, "shell", "rm", remotePath).catch(() => {});
+
+        return {
+          content: [{ type: "text" as const, text: `Screenshot saved: ${localFile}` }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Screenshot failed: ${msg.slice(0, 200)}` }] };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -373,7 +455,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: android-list-devices, android-install, android-launch, android-check-running, android-logcat, android-pull, android-deploy-and-verify");
+console.log("Tools: 9 | android-list-devices, android-install, android-launch, android-check-running, android-logcat, android-pull, android-deploy-and-verify, android-list-builds, android-screenshot");
 
 process.on("SIGTERM", () => {
   httpServer.stop();
