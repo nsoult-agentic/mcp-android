@@ -12,6 +12,7 @@
  *   android-deploy-and-verify  — Atomic: install → launch → check → logcat
  *   android-list-builds        — List APKs/AABs in /data/builds/
  *   android-screenshot         — Capture screenshot from device/emulator
+ *   android-build              — Trigger gradle build, output to /data/builds/
  *
  * SECURITY:
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
@@ -26,7 +27,7 @@
 import { resolve } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, copyFileSync, realpathSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -39,6 +40,9 @@ const execFile = promisify(execFileCb);
 const PORT = Number(process.env["PORT"]) || 8912;
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
+const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/trek-android").split(",").map((s) => s.trim());
+const ALLOWED_BUILD_TASKS = ["assembleDebug", "assembleRelease", "bundleDebug", "bundleRelease"];
+const BUILD_TIMEOUT_MS = 300_000; // 5 minutes
 const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sdcard/Pictures/", "/sdcard/Screenshots/", "/sdcard/Download/"];
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
@@ -415,6 +419,84 @@ function createServer(): McpServer {
     },
   );
 
+  // ── Tool: android-build ────────────────────────────────────
+
+  server.tool(
+    "android-build",
+    `Trigger a Gradle build on a local Android repo and copy output to /data/builds/. Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}. Allowed tasks: ${ALLOWED_BUILD_TASKS.join(", ")}.`,
+    {
+      repo_path: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe(`Absolute path to the Android repo (allowed: ${ALLOWED_BUILD_REPOS.join(", ")})`),
+      task: z
+        .enum(ALLOWED_BUILD_TASKS as [string, ...string[]])
+        .describe("Gradle build task to run"),
+    },
+    async ({ repo_path, task }) => {
+      try {
+        // Validate repo path against allowlist (realpathSync resolves symlinks)
+        let resolvedRepo: string;
+        try {
+          resolvedRepo = realpathSync(repo_path);
+        } catch {
+          return { content: [{ type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` }] };
+        }
+        if (!ALLOWED_BUILD_REPOS.some((r) => { try { return resolvedRepo === realpathSync(r); } catch { return false; } })) {
+          return {
+            content: [{ type: "text" as const, text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` }],
+          };
+        }
+
+        // Run gradle
+        const { stdout, stderr } = await execFile(
+          `${resolvedRepo}/gradlew`,
+          [task],
+          { cwd: resolvedRepo, timeout: BUILD_TIMEOUT_MS },
+        );
+
+        // Determine output directory based on task
+        const isBundle = task.startsWith("bundle");
+        const variant = task.replace(/^(assemble|bundle)/, "").toLowerCase();
+        const ext = isBundle ? "aab" : "apk";
+        const outputDir = isBundle
+          ? `${resolvedRepo}/app/build/outputs/bundle/${variant}`
+          : `${resolvedRepo}/app/build/outputs/apk/${variant}`;
+
+        // Find and copy output files
+        const copied: string[] = [];
+        try {
+          const files = await readdir(outputDir);
+          for (const f of files) {
+            if (!f.endsWith(`.${ext}`)) continue;
+            const src = realpathSync(resolve(outputDir, f));
+            const dest = `${ALLOWED_INSTALL_DIR}/${f}`;
+            copyFileSync(src, dest);
+            copied.push(dest);
+          }
+        } catch {
+          // Output dir might not exist for some tasks
+        }
+
+        const SENSITIVE_PATTERNS = /password|apiKey|token|secret|signing|credentials|KEYSTORE/i;
+        const buildOutput = (stderr || stdout)
+          .split("\n")
+          .filter((line) => !SENSITIVE_PATTERNS.test(line))
+          .join("\n")
+          .slice(-500);
+        const result = copied.length > 0
+          ? `Build succeeded.\n\nCopied to /data/builds/:\n${copied.map((c) => `- ${c}`).join("\n")}\n\nBuild output (last 500 chars):\n${buildOutput}`
+          : `Build completed but no .${ext} files found in ${outputDir}\n\nBuild output (last 500 chars):\n${buildOutput}`;
+
+        return { content: [{ type: "text" as const, text: result }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Build failed: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -457,7 +539,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 9 | android-list-devices, android-install, android-launch, android-check-running, android-logcat, android-pull, android-deploy-and-verify, android-list-builds, android-screenshot");
+console.log("Tools: 10 | android-list-devices, android-install, android-launch, android-check-running, android-logcat, android-pull, android-deploy-and-verify, android-list-builds, android-screenshot, android-build");
 
 process.on("SIGTERM", () => {
   httpServer.stop();
