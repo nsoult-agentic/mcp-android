@@ -57,7 +57,7 @@ const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sd
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
 const ADB_TIMEOUT_MS = 15_000;
-const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "";
+const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "http://172.16.10.25:8902/receive";
 
 // ── Validation ─────────────────────────────────────────────
 
