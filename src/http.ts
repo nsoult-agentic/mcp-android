@@ -21,6 +21,7 @@
  *   android-keyevent           — Send a key event (safe keycodes only)
  *   android-ui-dump            — Dump UI hierarchy as XML
  *   android-push-file          — Push file from /data/builds/ to NUC staging
+ *   android-adb-shell          — Run allowlisted ADB shell commands
  *
  * SECURITY:
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
@@ -915,6 +916,128 @@ function createServer(): McpServer {
     },
   );
 
+  // ── Tool: android-adb-shell ──────────────────────────────
+
+  const MAX_SHELL_OUTPUT_BYTES = 10 * 1024; // 10KB
+  const SETTINGS_NAMESPACE_REGEX = /^(system|secure|global)$/;
+  const SETTINGS_KEY_REGEX = /^[a-zA-Z0-9_]+$/;
+  const GETPROP_REGEX = /^[a-zA-Z0-9.]+$/;
+
+  /**
+   * Parse and validate an ADB shell command against the allowlist.
+   * Returns the args array for execFile (after "shell"), or throws on rejection.
+   */
+  function parseAdbShellCommand(command: string): string[] {
+    const parts = command.trim().split(/\s+/);
+    if (parts.length === 0) throw new Error("Empty command");
+
+    const cmd = parts[0];
+
+    // 1. pm clear <package>
+    if (cmd === "pm" && parts[1] === "clear" && parts.length === 3) {
+      validatePackage(parts[2]);
+      return ["pm", "clear", parts[2]];
+    }
+
+    // 2. am force-stop <package>
+    if (cmd === "am" && parts[1] === "force-stop" && parts.length === 3) {
+      validatePackage(parts[2]);
+      return ["am", "force-stop", parts[2]];
+    }
+
+    // 3 & 4. cmd connectivity airplane-mode enable/disable
+    if (cmd === "cmd" && parts[1] === "connectivity" && parts[2] === "airplane-mode" && parts.length === 4) {
+      if (parts[3] === "enable" || parts[3] === "disable") {
+        return ["cmd", "connectivity", "airplane-mode", parts[3]];
+      }
+    }
+
+    // 5. settings get <namespace> <key>
+    if (cmd === "settings" && parts[1] === "get" && parts.length === 4) {
+      if (!SETTINGS_NAMESPACE_REGEX.test(parts[2])) {
+        throw new Error(`Invalid settings namespace: ${parts[2]} (allowed: system, secure, global)`);
+      }
+      if (!SETTINGS_KEY_REGEX.test(parts[3])) {
+        throw new Error(`Invalid settings key: ${parts[3]} (alphanumeric and underscore only)`);
+      }
+      return ["settings", "get", parts[2], parts[3]];
+    }
+
+    // 6. settings put <namespace> <key> <value>
+    if (cmd === "settings" && parts[1] === "put" && parts.length === 5) {
+      if (!SETTINGS_NAMESPACE_REGEX.test(parts[2])) {
+        throw new Error(`Invalid settings namespace: ${parts[2]} (allowed: system, secure, global)`);
+      }
+      if (!SETTINGS_KEY_REGEX.test(parts[3])) {
+        throw new Error(`Invalid settings key: ${parts[3]} (alphanumeric and underscore only)`);
+      }
+      if (!SETTINGS_KEY_REGEX.test(parts[4])) {
+        throw new Error(`Invalid settings value: ${parts[4]} (alphanumeric and underscore only)`);
+      }
+      return ["settings", "put", parts[2], parts[3], parts[4]];
+    }
+
+    // 7. getprop <property>
+    if (cmd === "getprop" && parts.length === 2) {
+      if (!GETPROP_REGEX.test(parts[1])) {
+        throw new Error(`Invalid property name: ${parts[1]} (alphanumeric and dots only)`);
+      }
+      return ["getprop", parts[1]];
+    }
+
+    throw new Error(
+      `Command not allowed. Allowed commands: ` +
+      `pm clear <package>, ` +
+      `am force-stop <package>, ` +
+      `cmd connectivity airplane-mode enable|disable, ` +
+      `settings get|put <system|secure|global> <key> [<value>], ` +
+      `getprop <property>`
+    );
+  }
+
+  server.tool(
+    "android-adb-shell",
+    "Run an allowlisted ADB shell command on a device. " +
+    "Allowed commands: " +
+    "(1) pm clear <package> — clear app data, " +
+    "(2) am force-stop <package> — force stop app, " +
+    "(3) cmd connectivity airplane-mode enable — enable airplane mode, " +
+    "(4) cmd connectivity airplane-mode disable — disable airplane mode, " +
+    "(5) settings get <system|secure|global> <key> — read a system setting, " +
+    "(6) settings put <system|secure|global> <key> <value> — write a system setting (alphanumeric+underscore values only), " +
+    "(7) getprop <property> — read a system property (e.g. ro.build.version.sdk). " +
+    "All other commands are rejected.",
+    {
+      device_serial: z
+        .string()
+        .min(1)
+        .max(64)
+        .describe("Device serial (from android-list-devices)"),
+      command: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe("Shell command to run (must match allowlist)"),
+    },
+    async ({ device_serial, command }) => {
+      try {
+        validateSerial(device_serial);
+        const shellArgs = parseAdbShellCommand(command);
+        const result = await adb(device_serial, "shell", ...shellArgs);
+
+        // Truncate output to 10KB
+        const output = result.length > MAX_SHELL_OUTPUT_BYTES
+          ? result.slice(0, MAX_SHELL_OUTPUT_BYTES) + "\n(truncated — output exceeded 10KB)"
+          : result;
+
+        return { content: [{ type: "text" as const, text: output || `(no output)` }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `adb shell failed: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -957,7 +1080,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 18");
+console.log("Tools: 19");
 
 process.on("SIGTERM", () => {
   httpServer.stop();
