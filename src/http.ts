@@ -20,6 +20,7 @@
  *   android-input-text         — Type text into focused input field
  *   android-keyevent           — Send a key event (safe keycodes only)
  *   android-ui-dump            — Dump UI hierarchy as XML
+ *   android-push-file          — Push file from /data/builds/ to NUC staging
  *
  * SECURITY:
  *   - Allowlist-only: NO shell passthrough, NO arbitrary commands
@@ -56,6 +57,7 @@ const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sd
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
 const ADB_TIMEOUT_MS = 15_000;
+const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "";
 
 // ── Validation ─────────────────────────────────────────────
 
@@ -850,6 +852,69 @@ function createServer(): McpServer {
     },
   );
 
+  // ── Tool: android-push-file ───────────────────────────────
+
+  server.tool(
+    "android-push-file",
+    "Push a file from /data/builds/ to the NUC Nextcloud staging directory. Use after android-screenshot to stage files for nextcloud-upload. Requires FILE_RECEIVE_URL env var.",
+    {
+      path: z
+        .string()
+        .min(1)
+        .max(300)
+        .describe("File path relative to /data/builds/ (e.g., 'screenshots/emulator-5556_2026-04-30.png')"),
+    },
+    async ({ path: filePath }) => {
+      try {
+        if (!FILE_RECEIVE_URL) {
+          return { content: [{ type: "text" as const, text: "Error: FILE_RECEIVE_URL not configured" }] };
+        }
+
+        const full = resolve(ALLOWED_INSTALL_DIR, filePath);
+        if (!full.startsWith(ALLOWED_INSTALL_DIR + "/")) {
+          return { content: [{ type: "text" as const, text: "Error: path outside /data/builds/" }] };
+        }
+
+        const st = await stat(full).catch(() => null);
+        if (!st || !st.isFile()) {
+          return { content: [{ type: "text" as const, text: `Error: file not found: ${filePath}` }] };
+        }
+        if (st.size > MAX_DOWNLOAD_BYTES) {
+          const sizeMB = (st.size / 1_048_576).toFixed(2);
+          return { content: [{ type: "text" as const, text: `Error: file too large (${sizeMB} MB, max 10 MB)` }] };
+        }
+
+        const buf = await readFile(full);
+        const filename = basename(full);
+        const url = `${FILE_RECEIVE_URL}?filename=${encodeURIComponent(filename)}`;
+
+        const res = await fetch(url, {
+          method: "POST",
+          body: buf,
+          headers: { "Content-Type": "application/octet-stream" },
+          signal: AbortSignal.timeout(60_000),
+        });
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          return { content: [{ type: "text" as const, text: `Push failed (${res.status}): ${errBody.slice(0, 200)}` }] };
+        }
+
+        const result = await res.json() as { staged: string; size_bytes: number; local_path: string };
+        const sizeMB = (st.size / 1_048_576).toFixed(2);
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Pushed ${filePath} to NUC staging (${sizeMB} MB)\nStaged as: ${result.local_path}\nUse nextcloud-upload with local_path="${result.local_path}" to upload to Nextcloud.`,
+          }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Push failed: ${msg.slice(0, 200)}` }] };
+      }
+    },
+  );
+
   return server;
 }
 
@@ -892,7 +957,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 15 | android-list-devices, android-install, android-launch, android-check-running, android-logcat, android-pull, android-deploy-and-verify, android-list-builds, android-screenshot, android-build, android-tap, android-swipe, android-input-text, android-keyevent, android-ui-dump");
+console.log("Tools: 18");
 
 process.on("SIGTERM", () => {
   httpServer.stop();
