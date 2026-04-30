@@ -471,15 +471,21 @@ function createServer(): McpServer {
           for (const f of files) {
             if (!f.endsWith(`.${ext}`)) continue;
             const src = realpathSync(resolve(outputDir, f));
+            // Guard: source must be within the repo to prevent symlink escape
+            if (!src.startsWith(resolvedRepo + "/")) continue;
             const dest = `${ALLOWED_INSTALL_DIR}/${f}`;
             copyFileSync(src, dest);
             copied.push(dest);
           }
-        } catch {
-          // Output dir might not exist for some tasks
+        } catch (copyErr: unknown) {
+          // Output dir might not exist for some tasks; log real errors
+          const copyMsg = copyErr instanceof Error ? copyErr.message : "";
+          if (!copyMsg.includes("ENOENT")) {
+            copied.push(`(warning: ${copyMsg.slice(0, 100)})`);
+          }
         }
 
-        const SENSITIVE_PATTERNS = /password|apiKey|token|secret|signing|credentials|KEYSTORE/i;
+        const SENSITIVE_PATTERNS = /password|apiKey|api_key|token|secret|signing|credentials|keystore|store_password|key_password|key_alias/i;
         const buildOutput = (stderr || stdout)
           .split("\n")
           .filter((line) => !SENSITIVE_PATTERNS.test(line))
