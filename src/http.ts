@@ -397,11 +397,13 @@ function createServer(): McpServer {
         // Capture screenshot on device
         await adb(device_serial, "shell", "screencap", "-p", remotePath);
 
-        // Pull to local
-        await adb(device_serial, "pull", remotePath, localFile);
-
-        // Clean up device temp file
-        await adb(device_serial, "shell", "rm", remotePath).catch(() => {});
+        try {
+          // Pull to local
+          await adb(device_serial, "pull", remotePath, localFile);
+        } finally {
+          // Clean up device temp file regardless of pull success
+          await adb(device_serial, "shell", "rm", remotePath).catch(() => {});
+        }
 
         return {
           content: [{ type: "text" as const, text: `Screenshot saved: ${localFile}` }],
