@@ -551,7 +551,7 @@ function createServer(): McpServer {
           {
             cwd: resolved,
             timeout: REPO_SYNC_TIMEOUT_MS,
-            env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+            env: { HOME: process.env["HOME"], PATH: process.env["PATH"], GIT_TERMINAL_PROMPT: "0" },
           },
         );
 
@@ -566,7 +566,7 @@ function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         // Strip remote URLs that may contain credentials
-        const safe = msg.replace(/https?:\/\/[^\s]+/g, "[url-redacted]").slice(0, 500);
+        const safe = msg.replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]").slice(0, 500);
         return { content: [{ type: "text" as const, text: `Repo sync failed: ${safe}` }] };
       }
     },
@@ -1137,7 +1137,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 19");
+console.log("Tools: 20");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

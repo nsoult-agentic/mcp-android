@@ -15,7 +15,7 @@ FROM oven/bun:1.3.10-alpine
 WORKDIR /app
 
 # Install Android SDK platform-tools (ADB)
-RUN apk add --no-cache android-tools
+RUN apk add --no-cache android-tools git
 
 # Copy only production artifacts
 COPY --from=build /app/node_modules ./node_modules
