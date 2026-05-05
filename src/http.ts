@@ -54,7 +54,7 @@ const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
 const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/trek-android,/home/nsoult/git/embara-android").split(",").map((s) => s.trim());
 const ALLOWED_BUILD_TASKS = ["assembleDebug", "assembleRelease", "bundleDebug", "bundleRelease"];
-const BUILD_TIMEOUT_MS = 300_000; // 5 minutes
+const BUILD_TIMEOUT_MS = 1_200_000; // 20 minutes (first build downloads Gradle + all deps)
 const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sdcard/Pictures/", "/sdcard/Screenshots/", "/sdcard/Download/"];
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
