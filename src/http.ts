@@ -20,6 +20,7 @@
  *   android-input-text         — Type text into focused input field
  *   android-keyevent           — Send a key event (safe keycodes only)
  *   android-ui-dump            — Dump UI hierarchy as XML
+ *   android-repo-sync           — Git pull --ff-only on allowed repos
  *   android-push-file          — Push file from /data/builds/ to NUC staging
  *   android-adb-shell          — Run allowlisted ADB shell commands
  *
@@ -511,6 +512,62 @@ function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text" as const, text: `Build failed: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
+  // ── Tool: android-repo-sync ─────────────────────────────────
+
+  const GIT_PATH = "/usr/bin/git";
+  const REPO_SYNC_TIMEOUT_MS = 60_000;
+
+  server.tool(
+    "android-repo-sync",
+    `Pull latest changes (fast-forward only) on an allowed repo. Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}.`,
+    {
+      repo_path: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe(`Absolute path to the Android repo (allowed: ${ALLOWED_BUILD_REPOS.join(", ")})`),
+    },
+    async ({ repo_path }) => {
+      try {
+        let resolved: string;
+        try {
+          resolved = realpathSync(repo_path);
+        } catch {
+          return { content: [{ type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` }] };
+        }
+        if (!ALLOWED_BUILD_REPOS.some((r) => { try { return resolved === realpathSync(r); } catch { return false; } })) {
+          return {
+            content: [{ type: "text" as const, text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` }],
+          };
+        }
+
+        const { stdout, stderr } = await execFile(
+          GIT_PATH,
+          ["pull", "--ff-only"],
+          {
+            cwd: resolved,
+            timeout: REPO_SYNC_TIMEOUT_MS,
+            env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          },
+        );
+
+        const output = (stdout + "\n" + stderr).trim();
+        const alreadyUpToDate = output.includes("Already up to date");
+        const filesChanged = output.match(/(\d+) files? changed/)?.[0];
+        const summary = alreadyUpToDate
+          ? "Already up to date."
+          : `Updated: ${filesChanged || "changes pulled"}.`;
+
+        return { content: [{ type: "text" as const, text: summary }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Strip remote URLs that may contain credentials
+        const safe = msg.replace(/https?:\/\/[^\s]+/g, "[url-redacted]").slice(0, 500);
+        return { content: [{ type: "text" as const, text: `Repo sync failed: ${safe}` }] };
       }
     },
   );
