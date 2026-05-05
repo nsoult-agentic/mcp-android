@@ -555,7 +555,7 @@ function createServer(): McpServer {
               HOME: process.env["HOME"],
               PATH: process.env["PATH"],
               GIT_TERMINAL_PROMPT: "0",
-              GIT_SSH_COMMAND: "ssh -i /home/nsoult/.ssh/id_ed25519 -o UserKnownHostsFile=/home/nsoult/.ssh/known_hosts",
+              GIT_SSH_COMMAND: "ssh -i /home/pai/.ssh/id_ed25519_github_bot -o UserKnownHostsFile=/home/pai/.ssh/known_hosts",
             },
           },
         );
