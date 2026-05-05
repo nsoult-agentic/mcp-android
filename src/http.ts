@@ -551,7 +551,12 @@ function createServer(): McpServer {
           {
             cwd: resolved,
             timeout: REPO_SYNC_TIMEOUT_MS,
-            env: { HOME: process.env["HOME"], PATH: process.env["PATH"], GIT_TERMINAL_PROMPT: "0" },
+            env: {
+              HOME: process.env["HOME"],
+              PATH: process.env["PATH"],
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_SSH_COMMAND: "ssh -i /home/nsoult/.ssh/id_ed25519 -o UserKnownHostsFile=/home/nsoult/.ssh/known_hosts",
+            },
           },
         );
 
