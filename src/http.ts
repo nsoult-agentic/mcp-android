@@ -51,7 +51,7 @@ const execFile = promisify(execFileCb);
 const PORT = Number(process.env["PORT"]) || 8912;
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
-const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/trek-android").split(",").map((s) => s.trim());
+const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/trek-android,/home/nsoult/git/embara-android").split(",").map((s) => s.trim());
 const ALLOWED_BUILD_TASKS = ["assembleDebug", "assembleRelease", "bundleDebug", "bundleRelease"];
 const BUILD_TIMEOUT_MS = 300_000; // 5 minutes
 const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sdcard/Pictures/", "/sdcard/Screenshots/", "/sdcard/Download/"];
