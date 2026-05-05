@@ -1108,6 +1108,7 @@ function createServer(): McpServer {
 const httpServer = Bun.serve({
   port: PORT,
   hostname: "0.0.0.0",
+  idleTimeout: 255, // seconds; max allowed by Bun — builds can take 10+ min
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
