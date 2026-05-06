@@ -498,10 +498,15 @@ function createServer(): McpServer {
           }
         }
 
-        const SENSITIVE_PATTERNS = /password|apiKey|api_key|token|secret|signing|credentials|keystore|store_password|key_password|key_alias/i;
+        // Redact values (not entire lines) so error context is preserved
+        const SENSITIVE_VALUE_PATTERN = /(?:password|apiKey|api_key|token|secret|credentials|keystore|store_password|key_password|key_alias)\s*[=:]\s*\S+/gi;
         const buildOutput = (stderr || stdout)
           .split("\n")
-          .filter((line) => !SENSITIVE_PATTERNS.test(line))
+          .map((line) => line.replace(SENSITIVE_VALUE_PATTERN, (match) => {
+            const sep = match.includes("=") ? "=" : ":";
+            const key = match.split(/[=:]/)[0];
+            return `${key}${sep}[REDACTED]`;
+          }))
           .join("\n")
           .slice(-500);
         const result = copied.length > 0
