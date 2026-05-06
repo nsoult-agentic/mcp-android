@@ -17,8 +17,10 @@ FROM oven/bun:1.3.10-debian
 WORKDIR /app
 
 # Temurin 21 (matches CI; for AGP 9.x) + ADB, git, SSH for repo-sync
+# ca-certificates is required: wget needs it for HTTPS but it's only a
+# Recommends (not Depends), so --no-install-recommends skips it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget apt-transport-https gpg \
+    ca-certificates wget apt-transport-https gpg \
     && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/adoptium-archive-keyring.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" > /etc/apt/sources.list.d/adoptium.list \
     && apt-get update && apt-get install -y --no-install-recommends \
