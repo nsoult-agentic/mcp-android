@@ -16,15 +16,19 @@ FROM oven/bun:1.3.10-debian
 
 WORKDIR /app
 
-# JDK 21 (for AGP 9.x) + ADB, git, SSH for repo-sync
+# Temurin 21 (matches CI; for AGP 9.x) + ADB, git, SSH for repo-sync
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-21-jdk-headless \
+    wget apt-transport-https gpg \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/adoptium-archive-keyring.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    temurin-21-jdk \
     adb \
     git \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64
 
 # Copy only production artifacts
 COPY --from=build /app/node_modules ./node_modules
