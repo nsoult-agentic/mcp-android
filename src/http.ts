@@ -35,7 +35,7 @@
  */
 
 import { resolve } from "node:path";
-import { execFile as execFileCb } from "node:child_process";
+import { execFile as execFileCb, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdirSync, copyFileSync, realpathSync } from "node:fs";
 import { readdir, stat, readFile, unlink } from "node:fs/promises";
@@ -1143,6 +1143,120 @@ function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text" as const, text: `adb shell failed: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
+  // ── Screen Recording (background) ─────────────────────────
+
+  // Track active recording processes per device
+  const activeRecordings = new Map<string, ReturnType<typeof spawn>>();
+
+  server.tool(
+    "android-screenrecord-start",
+    "Start recording the screen in the background. Returns immediately — use android-screenrecord-stop to end. Only one recording per device at a time. Max 180 seconds (auto-stops). Output saved to /sdcard/.",
+    {
+      device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
+      output_file: z.string().min(1).max(100)
+        .default("recording.mp4")
+        .describe("Output filename (saved to /sdcard/, must end with .mp4)"),
+      time_limit: z.number().int().min(5).max(180)
+        .default(60)
+        .describe("Max recording duration in seconds (default 60, max 180)"),
+    },
+    async ({ device_serial, output_file, time_limit }) => {
+      try {
+        validateSerial(device_serial);
+
+        if (!output_file.endsWith(".mp4")) {
+          return { content: [{ type: "text" as const, text: "Error: output_file must end with .mp4" }] };
+        }
+        if (/[^a-zA-Z0-9_\-.]/.test(output_file)) {
+          return { content: [{ type: "text" as const, text: "Error: output_file must be alphanumeric with dashes/underscores only" }] };
+        }
+
+        if (activeRecordings.has(device_serial)) {
+          return { content: [{ type: "text" as const, text: "Error: recording already in progress on this device. Stop it first." }] };
+        }
+
+        const outputPath = `/sdcard/${output_file}`;
+        const proc = spawn(ADB_PATH, [
+          "-s", device_serial,
+          "shell", "screenrecord",
+          "--time-limit", String(time_limit),
+          outputPath,
+        ], { stdio: "ignore" });
+
+        activeRecordings.set(device_serial, proc);
+
+        // Auto-cleanup when process exits (time-limit reached or killed)
+        proc.on("exit", () => {
+          activeRecordings.delete(device_serial);
+        });
+
+        // Brief delay to ensure screenrecord actually started
+        await new Promise((r) => setTimeout(r, 500));
+
+        if (proc.exitCode !== null) {
+          activeRecordings.delete(device_serial);
+          return { content: [{ type: "text" as const, text: "Error: screenrecord exited immediately. Is the device screen on?" }] };
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Recording started on ${device_serial}\nOutput: ${outputPath}\nTime limit: ${time_limit}s\nUse android-screenrecord-stop to end recording.`,
+          }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Error: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
+  server.tool(
+    "android-screenrecord-stop",
+    "Stop an active screen recording. Sends SIGINT to finalize the MP4 file. Returns the device path of the recording.",
+    {
+      device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
+    },
+    async ({ device_serial }) => {
+      try {
+        validateSerial(device_serial);
+
+        const proc = activeRecordings.get(device_serial);
+        if (!proc) {
+          return { content: [{ type: "text" as const, text: "No active recording on this device." }] };
+        }
+
+        // SIGINT tells screenrecord to finalize the MP4 (write moov atom)
+        // SIGKILL would produce a corrupt file
+        proc.kill("SIGINT");
+
+        // Wait for process to exit and file to finalize
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => {
+            proc.kill("SIGKILL"); // force kill if stuck
+            resolve();
+          }, 5000);
+          proc.on("exit", () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+        });
+
+        activeRecordings.delete(device_serial);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Recording stopped on ${device_serial}.\nUse android-pull to retrieve the file from /sdcard/.`,
+          }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Error: ${msg.slice(0, 500)}` }] };
       }
     },
   );
