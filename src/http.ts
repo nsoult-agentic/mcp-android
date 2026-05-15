@@ -1154,12 +1154,12 @@ function createServer(): McpServer {
 
   server.tool(
     "android-screenrecord-start",
-    "Start recording the screen in the background. Returns immediately — use android-screenrecord-stop to end. Only one recording per device at a time. Max 180 seconds (auto-stops). Output saved to /sdcard/.",
+    "Start recording the screen in the background. Returns immediately — use android-screenrecord-stop to end. Only one recording per device at a time. Max 180 seconds (auto-stops). Output saved to /sdcard/Download/.",
     {
       device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
       output_file: z.string().min(1).max(100)
         .default("recording.mp4")
-        .describe("Output filename (saved to /sdcard/, must end with .mp4)"),
+        .describe("Output filename (saved to /sdcard/Download/, must end with .mp4)"),
       time_limit: z.number().int().min(5).max(180)
         .default(60)
         .describe("Max recording duration in seconds (default 60, max 180)"),
@@ -1179,7 +1179,7 @@ function createServer(): McpServer {
           return { content: [{ type: "text" as const, text: "Error: recording already in progress on this device. Stop it first." }] };
         }
 
-        const outputPath = `/sdcard/${output_file}`;
+        const outputPath = `/sdcard/Download/${output_file}`;
         const proc = spawn(ADB_PATH, [
           "-s", device_serial,
           "shell", "screenrecord",
@@ -1251,7 +1251,7 @@ function createServer(): McpServer {
         return {
           content: [{
             type: "text" as const,
-            text: `Recording stopped on ${device_serial}.\nUse android-pull to retrieve the file from /sdcard/.`,
+            text: `Recording stopped on ${device_serial}.\nUse android-pull to retrieve the file from /sdcard/Download/.`,
           }],
         };
       } catch (err: unknown) {
