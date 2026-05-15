@@ -88,13 +88,15 @@ function validateSerial(serial: string): void {
 
 function validateInstallPath(filePath: string): string {
   const resolved = resolve(filePath);
-  if (!resolved.startsWith(ALLOWED_INSTALL_DIR + "/")) {
+  let real: string;
+  try { real = realpathSync(resolved); } catch { throw new Error(`Path does not exist: ${filePath}`); }
+  if (!real.startsWith(ALLOWED_INSTALL_DIR + "/")) {
     throw new Error(`Path outside allowed directory: ${ALLOWED_INSTALL_DIR}`);
   }
-  if (!resolved.endsWith(".apk")) {
+  if (!real.endsWith(".apk")) {
     throw new Error("Only .apk files can be installed");
   }
-  return resolved;
+  return real;
 }
 
 // F10: Reject path traversal on device paths
@@ -111,7 +113,11 @@ function validatePullDevicePath(devicePath: string): void {
 // F3: Validate local pull destination — restrict to /data/builds/
 function validatePullLocalPath(localPath: string): string {
   const resolved = resolve(localPath);
-  if (!resolved.startsWith(ALLOWED_PULL_LOCAL_DIR + "/")) {
+  // For pull destinations, the file may not exist yet — validate the parent directory
+  const parentDir = resolve(resolved, "..");
+  let realParent: string;
+  try { realParent = realpathSync(parentDir); } catch { throw new Error(`Parent directory does not exist: ${parentDir}`); }
+  if (!realParent.startsWith(ALLOWED_PULL_LOCAL_DIR) || (realParent !== ALLOWED_PULL_LOCAL_DIR && !realParent.startsWith(ALLOWED_PULL_LOCAL_DIR + "/"))) {
     throw new Error(`Pull destination restricted to: ${ALLOWED_PULL_LOCAL_DIR}`);
   }
   return resolved;
@@ -148,12 +154,16 @@ function isRateLimited(): boolean {
   return false;
 }
 
+// ── Active Recordings (module scope — survives across /mcp requests) ──
+
+const activeRecordings = new Map<string, { proc: ReturnType<typeof spawn>; outputPath: string }>();
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   // --- Device management ---
@@ -172,7 +182,7 @@ function createServer(): McpServer {
 
   // --- App management ---
 
-  const InstallInput = { device_serial: z.string(), apk_path: z.string() };
+  const InstallInput = { device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"), apk_path: z.string() };
   server.tool(
     "android-install",
     "Install an APK on a device. Path restricted to /data/builds/.",
@@ -186,7 +196,7 @@ function createServer(): McpServer {
   );
 
   const LaunchInput = {
-    device_serial: z.string(),
+    device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
     package_name: z.string(),
     activity_name: z.string(),
   };
@@ -204,7 +214,7 @@ function createServer(): McpServer {
     },
   );
 
-  const CheckInput = { device_serial: z.string(), package_name: z.string() };
+  const CheckInput = { device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"), package_name: z.string() };
   server.tool(
     "android-check-running",
     "Check if an app is running on the device (returns PID or empty).",
@@ -226,7 +236,7 @@ function createServer(): McpServer {
   // --- Logging ---
 
   const LogcatInput = {
-    device_serial: z.string(),
+    device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
     package_name: z.string().optional(),
     lines: z.number().max(MAX_LOGCAT_LINES).default(50),
     errors_only: z.boolean().default(false),
@@ -273,7 +283,7 @@ function createServer(): McpServer {
   // --- File operations ---
 
   const PullInput = {
-    device_serial: z.string(),
+    device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
     device_path: z.string(),
     local_path: z.string().default("/data/builds/pulled"),
   };
@@ -284,7 +294,14 @@ function createServer(): McpServer {
     async ({ device_serial, device_path, local_path }) => {
       validateSerial(device_serial);
       validatePullDevicePath(device_path);
-      const safeLocalPath = validatePullLocalPath(local_path);
+      // If using default path, create pulled/ dir and preserve original filename
+      let targetPath = local_path;
+      if (local_path === "/data/builds/pulled") {
+        const pulledDir = "/data/builds/pulled";
+        mkdirSync(pulledDir, { recursive: true });
+        targetPath = `${pulledDir}/${basename(device_path)}`;
+      }
+      const safeLocalPath = validatePullLocalPath(targetPath);
       const result = await adb(device_serial, "pull", device_path, safeLocalPath);
       return { content: [{ type: "text" as const, text: result }] };
     },
@@ -293,7 +310,7 @@ function createServer(): McpServer {
   // --- Composite ---
 
   const DeployInput = {
-    device_serial: z.string(),
+    device_serial: z.string().min(1).max(64).describe("Device serial (from android-list-devices)"),
     apk_path: z.string(),
     package_name: z.string(),
     activity_name: z.string(),
@@ -391,7 +408,7 @@ function createServer(): McpServer {
 
   server.tool(
     "android-screenshot",
-    "Capture a screenshot from a device or emulator. Saves to /data/builds/screenshots/ and returns the file path.",
+    "Capture a screenshot from a device or emulator. Saves to /data/builds/screenshots/ and auto-pushes to NUC staging for Read tool access. Returns both the NUC path and container path.",
     {
       device_serial: z
         .string()
@@ -422,8 +439,35 @@ function createServer(): McpServer {
           await adb(device_serial, "shell", "rm", remotePath).catch(() => {});
         }
 
+        // Auto-push to NUC for Read tool access
+        let nucPath: string | null = null;
+        if (FILE_RECEIVE_URL) {
+          try {
+            const buf = await readFile(localFile);
+            const filename = basename(localFile);
+            const url = `${FILE_RECEIVE_URL}?filename=${encodeURIComponent(filename)}`;
+            const res = await fetch(url, {
+              method: "POST",
+              body: buf,
+              headers: { "Content-Type": "application/octet-stream" },
+              signal: AbortSignal.timeout(60_000),
+            });
+            if (res.ok) {
+              const result = await res.json() as { staged: string; size_bytes: number; local_path: string };
+              nucPath = result.local_path;
+            }
+          } catch {
+            // Push failed — fall back gracefully
+          }
+        }
+
+        if (nucPath) {
+          return {
+            content: [{ type: "text" as const, text: `Screenshot saved and pushed to NUC.\nNUC path (for Read tool): ${nucPath}\nContainer path: ${localFile}` }],
+          };
+        }
         return {
-          content: [{ type: "text" as const, text: `Screenshot saved: ${localFile}` }],
+          content: [{ type: "text" as const, text: `Screenshot saved: ${localFile}\n(auto-push to NUC failed or not configured — use android-push-file to push manually)` }],
         };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -599,7 +643,7 @@ function createServer(): McpServer {
     async ({ directory }) => {
       try {
         const base = resolve(ALLOWED_INSTALL_DIR, directory || ".");
-        if (!base.startsWith(ALLOWED_INSTALL_DIR)) {
+        if (base !== ALLOWED_INSTALL_DIR && !base.startsWith(ALLOWED_INSTALL_DIR + "/")) {
           return { content: [{ type: "text" as const, text: "Error: path outside /data/builds/" }] };
         }
 
@@ -609,7 +653,9 @@ function createServer(): McpServer {
           const items = await readdir(dir).catch(() => [] as string[]);
           for (const item of items) {
             const full = resolve(dir, item);
-            if (!full.startsWith(ALLOWED_INSTALL_DIR)) continue;
+            let realFull: string;
+            try { realFull = realpathSync(full); } catch { continue; }
+            if (!realFull.startsWith(ALLOWED_INSTALL_DIR + "/") && realFull !== ALLOWED_INSTALL_DIR) continue;
             const st = await stat(full).catch(() => null);
             if (!st) continue;
             const rel = full.slice(ALLOWED_INSTALL_DIR.length + 1);
@@ -650,11 +696,13 @@ function createServer(): McpServer {
     async ({ path: filePath }) => {
       try {
         const full = resolve(ALLOWED_INSTALL_DIR, filePath);
-        if (!full.startsWith(ALLOWED_INSTALL_DIR + "/")) {
+        let real: string;
+        try { real = realpathSync(full); } catch { return { content: [{ type: "text" as const, text: `Error: file not found: ${filePath}` }] }; }
+        if (!real.startsWith(ALLOWED_INSTALL_DIR + "/")) {
           return { content: [{ type: "text" as const, text: "Error: path outside /data/builds/" }] };
         }
 
-        const st = await stat(full).catch(() => null);
+        const st = await stat(real).catch(() => null);
         if (!st || !st.isFile()) {
           return { content: [{ type: "text" as const, text: `Error: file not found: ${filePath}` }] };
         }
@@ -663,9 +711,9 @@ function createServer(): McpServer {
           return { content: [{ type: "text" as const, text: `Error: file too large (${sizeMB} MB, max 10 MB)` }] };
         }
 
-        const buf = await readFile(full);
+        const buf = await readFile(real);
         const b64 = buf.toString("base64");
-        const name = basename(full);
+        const name = basename(real);
 
         return {
           content: [{
@@ -906,8 +954,8 @@ function createServer(): McpServer {
           truncated = true;
         }
 
-        const suffix = truncated ? "\n\n(truncated — output exceeded 50KB)" : "";
-        return { content: [{ type: "text" as const, text: xml + suffix }] };
+        const truncationNote = truncated ? "\n\n(truncated — output exceeded 50KB)" : "";
+        return { content: [{ type: "text" as const, text: xml + truncationNote }] };
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text" as const, text: `UI dump failed: ${msg.slice(0, 200)}` }] };
@@ -1052,54 +1100,13 @@ function createServer(): McpServer {
       return ["getprop", parts[1]];
     }
 
-    // 8. screenrecord <output_path> [--time-limit N] [--size WxH]
-    if (cmd === "screenrecord") {
-      const args: string[] = ["screenrecord"];
-      const SCREENRECORD_PATH_REGEX = /^\/sdcard\/[a-zA-Z0-9_\-/.]+\.mp4$/;
-      let outputPath: string | null = null;
-
-      for (let i = 1; i < parts.length; i++) {
-        if (parts[i] === "--time-limit" && i + 1 < parts.length) {
-          const limit = parseInt(parts[i + 1], 10);
-          if (isNaN(limit) || limit < 1 || limit > 180) {
-            throw new Error("--time-limit must be 1-180 seconds");
-          }
-          args.push("--time-limit", String(limit));
-          i++;
-        } else if (parts[i] === "--size" && i + 1 < parts.length) {
-          if (!/^\d{3,4}x\d{3,4}$/.test(parts[i + 1])) {
-            throw new Error("--size must be WxH (e.g., 720x1280)");
-          }
-          args.push("--size", parts[i + 1]);
-          i++;
-        } else if (!parts[i].startsWith("--") && !outputPath) {
-          outputPath = parts[i];
-        } else {
-          throw new Error(`Invalid screenrecord argument: ${parts[i]}`);
-        }
-      }
-
-      if (!outputPath) {
-        throw new Error("screenrecord requires an output path (e.g., /sdcard/demo.mp4)");
-      }
-      if (!SCREENRECORD_PATH_REGEX.test(outputPath)) {
-        throw new Error("Output path must be under /sdcard/ and end with .mp4");
-      }
-      if (outputPath.includes("..")) {
-        throw new Error("Path traversal not allowed");
-      }
-      args.push(outputPath);
-      return args;
-    }
-
     throw new Error(
       `Command not allowed. Allowed commands: ` +
       `pm clear <package>, ` +
       `am force-stop <package>, ` +
       `cmd connectivity airplane-mode enable|disable, ` +
       `settings get|put <system|secure|global> <key> [<value>], ` +
-      `getprop <property>, ` +
-      `screenrecord /sdcard/<file>.mp4 [--time-limit N] [--size WxH]`
+      `getprop <property>`
     );
   }
 
@@ -1112,7 +1119,6 @@ function createServer(): McpServer {
     "(3) cmd connectivity airplane-mode enable — enable airplane mode, " +
     "(4) cmd connectivity airplane-mode disable — disable airplane mode, " +
     "(5) settings get <system|secure|global> <key> — read a system setting, " +
-    "(8) screenrecord /sdcard/<file>.mp4 [--time-limit N] [--size WxH] — record screen video (max 180s), " +
     "(6) settings put <system|secure|global> <key> <value> — write a system setting (alphanumeric+underscore values only), " +
     "(7) getprop <property> — read a system property (e.g. ro.build.version.sdk). " +
     "All other commands are rejected.",
@@ -1149,9 +1155,6 @@ function createServer(): McpServer {
 
   // ── Screen Recording (background) ─────────────────────────
 
-  // Track active recording processes per device
-  const activeRecordings = new Map<string, ReturnType<typeof spawn>>();
-
   server.tool(
     "android-screenrecord-start",
     "Start recording the screen in the background. Returns immediately — use android-screenrecord-stop to end. Only one recording per device at a time. Max 180 seconds (auto-stops). Output saved to /sdcard/Download/.",
@@ -1187,7 +1190,7 @@ function createServer(): McpServer {
           outputPath,
         ], { stdio: "ignore" });
 
-        activeRecordings.set(device_serial, proc);
+        activeRecordings.set(device_serial, { proc, outputPath });
 
         // Auto-cleanup when process exits (time-limit reached or killed)
         proc.on("exit", () => {
@@ -1225,22 +1228,22 @@ function createServer(): McpServer {
       try {
         validateSerial(device_serial);
 
-        const proc = activeRecordings.get(device_serial);
-        if (!proc) {
+        const recording = activeRecordings.get(device_serial);
+        if (!recording) {
           return { content: [{ type: "text" as const, text: "No active recording on this device." }] };
         }
 
         // SIGINT tells screenrecord to finalize the MP4 (write moov atom)
         // SIGKILL would produce a corrupt file
-        proc.kill("SIGINT");
+        recording.proc.kill("SIGINT");
 
         // Wait for process to exit and file to finalize
         await new Promise<void>((resolve) => {
           const timeout = setTimeout(() => {
-            proc.kill("SIGKILL"); // force kill if stuck
+            recording.proc.kill("SIGKILL"); // force kill if stuck
             resolve();
           }, 5000);
-          proc.on("exit", () => {
+          recording.proc.on("exit", () => {
             clearTimeout(timeout);
             resolve();
           });
@@ -1251,7 +1254,7 @@ function createServer(): McpServer {
         return {
           content: [{
             type: "text" as const,
-            text: `Recording stopped on ${device_serial}.\nUse android-pull to retrieve the file from /sdcard/Download/.`,
+            text: `Recording stopped on ${device_serial}.\nFile: ${recording.outputPath}\nUse android-pull to retrieve from /sdcard/Download/.`,
           }],
         };
       } catch (err: unknown) {
