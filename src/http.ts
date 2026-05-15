@@ -1052,13 +1052,54 @@ function createServer(): McpServer {
       return ["getprop", parts[1]];
     }
 
+    // 8. screenrecord <output_path> [--time-limit N] [--size WxH]
+    if (cmd === "screenrecord") {
+      const args: string[] = ["screenrecord"];
+      const SCREENRECORD_PATH_REGEX = /^\/sdcard\/[a-zA-Z0-9_\-/.]+\.mp4$/;
+      let outputPath: string | null = null;
+
+      for (let i = 1; i < parts.length; i++) {
+        if (parts[i] === "--time-limit" && i + 1 < parts.length) {
+          const limit = parseInt(parts[i + 1], 10);
+          if (isNaN(limit) || limit < 1 || limit > 180) {
+            throw new Error("--time-limit must be 1-180 seconds");
+          }
+          args.push("--time-limit", String(limit));
+          i++;
+        } else if (parts[i] === "--size" && i + 1 < parts.length) {
+          if (!/^\d{3,4}x\d{3,4}$/.test(parts[i + 1])) {
+            throw new Error("--size must be WxH (e.g., 720x1280)");
+          }
+          args.push("--size", parts[i + 1]);
+          i++;
+        } else if (!parts[i].startsWith("--") && !outputPath) {
+          outputPath = parts[i];
+        } else {
+          throw new Error(`Invalid screenrecord argument: ${parts[i]}`);
+        }
+      }
+
+      if (!outputPath) {
+        throw new Error("screenrecord requires an output path (e.g., /sdcard/demo.mp4)");
+      }
+      if (!SCREENRECORD_PATH_REGEX.test(outputPath)) {
+        throw new Error("Output path must be under /sdcard/ and end with .mp4");
+      }
+      if (outputPath.includes("..")) {
+        throw new Error("Path traversal not allowed");
+      }
+      args.push(outputPath);
+      return args;
+    }
+
     throw new Error(
       `Command not allowed. Allowed commands: ` +
       `pm clear <package>, ` +
       `am force-stop <package>, ` +
       `cmd connectivity airplane-mode enable|disable, ` +
       `settings get|put <system|secure|global> <key> [<value>], ` +
-      `getprop <property>`
+      `getprop <property>, ` +
+      `screenrecord /sdcard/<file>.mp4 [--time-limit N] [--size WxH]`
     );
   }
 
@@ -1071,6 +1112,7 @@ function createServer(): McpServer {
     "(3) cmd connectivity airplane-mode enable — enable airplane mode, " +
     "(4) cmd connectivity airplane-mode disable — disable airplane mode, " +
     "(5) settings get <system|secure|global> <key> — read a system setting, " +
+    "(8) screenrecord /sdcard/<file>.mp4 [--time-limit N] [--size WxH] — record screen video (max 180s), " +
     "(6) settings put <system|secure|global> <key> <value> — write a system setting (alphanumeric+underscore values only), " +
     "(7) getprop <property> — read a system property (e.g. ro.build.version.sdk). " +
     "All other commands are rejected.",
