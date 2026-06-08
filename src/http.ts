@@ -61,6 +61,25 @@ const MAX_LOGCAT_LINES = 500;
 const ADB_TIMEOUT_MS = 15_000;
 const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "http://172.16.10.25:8902/receive";
 
+// Repo allowlist matcher. An entry ending in "/*" allows any direct child
+// directory of that base (so new projects dropped under it build with no
+// config change). All other entries require an exact realpath match.
+// realpathSync resolves symlinks on both sides to prevent symlink escape.
+function isAllowedBuildRepo(resolvedRepo: string): boolean {
+  return ALLOWED_BUILD_REPOS.some((entry) => {
+    try {
+      if (entry.endsWith("/*")) {
+        const baseReal = realpathSync(entry.slice(0, -2));
+        const parentReal = realpathSync(resolve(resolvedRepo, ".."));
+        return parentReal === baseReal;
+      }
+      return resolvedRepo === realpathSync(entry);
+    } catch {
+      return false;
+    }
+  });
+}
+
 // ── Validation ─────────────────────────────────────────────
 
 const PACKAGE_REGEX = /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$/;
@@ -500,7 +519,7 @@ function createServer(): McpServer {
         } catch {
           return { content: [{ type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` }] };
         }
-        if (!ALLOWED_BUILD_REPOS.some((r) => { try { return resolvedRepo === realpathSync(r); } catch { return false; } })) {
+        if (!isAllowedBuildRepo(resolvedRepo)) {
           return {
             content: [{ type: "text" as const, text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` }],
           };
@@ -588,7 +607,7 @@ function createServer(): McpServer {
         } catch {
           return { content: [{ type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` }] };
         }
-        if (!ALLOWED_BUILD_REPOS.some((r) => { try { return resolved === realpathSync(r); } catch { return false; } })) {
+        if (!isAllowedBuildRepo(resolved)) {
           return {
             content: [{ type: "text" as const, text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` }],
           };
