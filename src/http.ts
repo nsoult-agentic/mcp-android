@@ -53,7 +53,7 @@ const PORT = Number(process.env["PORT"]) || 8912;
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
 const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/embara-android").split(",").map((s) => s.trim());
-const ALLOWED_BUILD_TASKS = ["assembleDebug", "assembleRelease", "bundleDebug", "bundleRelease"];
+const ALLOWED_BUILD_TASKS = ["assembleDebug", "assembleRelease", "bundleDebug", "bundleRelease", "test", "check"];
 const BUILD_TIMEOUT_MS = 1_200_000; // 20 minutes (first build downloads Gradle + all deps)
 const ALLOWED_PULL_PREFIXES = ["/sdcard/Android/data/", "/data/local/tmp/", "/sdcard/Pictures/", "/sdcard/Screenshots/", "/sdcard/Download/"];
 const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
@@ -182,7 +182,7 @@ const activeRecordings = new Map<string, { proc: ReturnType<typeof spawn>; outpu
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   // --- Device management ---
@@ -499,7 +499,7 @@ function createServer(): McpServer {
 
   server.tool(
     "android-build",
-    `Trigger a Gradle build on a local Android repo and copy output to /data/builds/. Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}. Allowed tasks: ${ALLOWED_BUILD_TASKS.join(", ")}.`,
+    `Trigger a Gradle task on a local repo. assemble*/bundle* copy the APK/AAB to /data/builds/; test/check run JVM unit tests and report pass/fail (no artifact). Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}. Allowed tasks: ${ALLOWED_BUILD_TASKS.join(", ")}.`,
     {
       repo_path: z
         .string()
@@ -525,14 +525,49 @@ function createServer(): McpServer {
           };
         }
 
-        // Run gradle
-        const { stdout, stderr } = await execFile(
-          `${resolvedRepo}/gradlew`,
-          [task],
-          { cwd: resolvedRepo, timeout: BUILD_TIMEOUT_MS },
-        );
+        // Redact sensitive values (not entire lines) so error context is preserved.
+        const SENSITIVE_VALUE_PATTERN = /(?:password|apiKey|api_key|token|secret|credentials|keystore|store_password|key_password|key_alias)\s*[=:]\s*\S+/gi;
+        const redact = (s: string): string =>
+          s.split("\n").map((line) => line.replace(SENSITIVE_VALUE_PATTERN, (match) => {
+            const sep = match.includes("=") ? "=" : ":";
+            const key = match.split(/[=:]/)[0];
+            return `${key}${sep}[REDACTED]`;
+          })).join("\n");
 
-        // Determine output directory based on task
+        const isTestTask = task === "test" || task === "check" || task.endsWith(":test") || task.endsWith(":check");
+
+        // Run gradle. maxBuffer raised — first runs download Gradle + deps and can
+        // exceed Node's default 1MB stdout cap (which would surface as a spurious error).
+        let stdout = "", stderr = "";
+        try {
+          const res = await execFile(
+            `${resolvedRepo}/gradlew`,
+            [task],
+            { cwd: resolvedRepo, timeout: BUILD_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+          );
+          stdout = res.stdout; stderr = res.stderr;
+        } catch (runErr: unknown) {
+          // Non-zero gradle exit (failing tests / compile error). Surface stdout+stderr
+          // so the caller sees WHICH tests failed — not just "Command failed".
+          const e = runErr as { stdout?: string; stderr?: string; message?: string };
+          const combined = redact(`${e.stdout || ""}\n${e.stderr || ""}`).trim();
+          const tail = (combined.length > 0 ? combined : redact(e.message || String(runErr))).slice(-4000);
+          const label = isTestTask ? "Tests failed" : "Build failed";
+          return { content: [{ type: "text" as const, text: `${label} (gradle exit non-zero):\n\n${tail}` }] };
+        }
+
+        // Test/check tasks produce no APK/AAB — report pass + report locations, skip copy.
+        if (isTestTask) {
+          const out = redact(`${stdout}\n${stderr}`).slice(-4000);
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Tests passed (${task}).\n\nHTML reports: <module>/build/reports/tests/\nXML results:  <module>/build/test-results/\n\nGradle output (last 4000 chars):\n${out}`,
+            }],
+          };
+        }
+
+        // Determine output directory based on task (assemble/bundle)
         const isBundle = task.startsWith("bundle");
         const variant = task.replace(/^(assemble|bundle)/, "").toLowerCase();
         const ext = isBundle ? "aab" : "apk";
@@ -561,17 +596,7 @@ function createServer(): McpServer {
           }
         }
 
-        // Redact values (not entire lines) so error context is preserved
-        const SENSITIVE_VALUE_PATTERN = /(?:password|apiKey|api_key|token|secret|credentials|keystore|store_password|key_password|key_alias)\s*[=:]\s*\S+/gi;
-        const buildOutput = (stderr || stdout)
-          .split("\n")
-          .map((line) => line.replace(SENSITIVE_VALUE_PATTERN, (match) => {
-            const sep = match.includes("=") ? "=" : ":";
-            const key = match.split(/[=:]/)[0];
-            return `${key}${sep}[REDACTED]`;
-          }))
-          .join("\n")
-          .slice(-500);
+        const buildOutput = redact(stderr || stdout).slice(-500);
         const result = copied.length > 0
           ? `Build succeeded.\n\nCopied to /data/builds/:\n${copied.map((c) => `- ${c}`).join("\n")}\n\nBuild output (last 500 chars):\n${buildOutput}`
           : `Build completed but no .${ext} files found in ${outputDir}\n\nBuild output (last 500 chars):\n${buildOutput}`;
