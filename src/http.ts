@@ -4,6 +4,8 @@
  *
  * Tools:
  *   android-list-devices      — List connected devices/emulators
+ *   android-emulator-start     — Boot a headless GPU emulator (Xvfb + /dev/dri), wait for boot
+ *   android-emulator-stop      — Stop a running emulator (adb emu kill)
  *   android-install            — Install APK on device (path-restricted)
  *   android-launch             — Launch an app by package/activity
  *   android-check-running      — Check if an app is running (pidof)
@@ -37,7 +39,7 @@
 import { resolve } from "node:path";
 import { execFile as execFileCb, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdirSync, copyFileSync, realpathSync } from "node:fs";
+import { mkdirSync, copyFileSync, realpathSync, existsSync } from "node:fs";
 import { readdir, stat, readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename } from "node:path";
@@ -46,6 +48,11 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 
 const execFile = promisify(execFileCb);
+
+// Create files group-writable (umask 002) so emulator/AVD/build artifacts land in the shared
+// 'android' group as group-writable — required for the rootless container AND host users
+// (pai/nsoult/seny) to share /srv/android via setgid. See SB #2420.
+process.umask(0o002);
 
 // ── Configuration ──────────────────────────────────────────
 
@@ -60,6 +67,17 @@ const ALLOWED_PULL_LOCAL_DIR = "/data/builds";
 const MAX_LOGCAT_LINES = 500;
 const ADB_TIMEOUT_MS = 15_000;
 const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "http://172.16.10.25:8902/receive";
+
+// Emulator lifecycle config. The SDK is host-mounted at ANDROID_HOME; the emulator runs headless
+// with a real GPU (/dev/dri) into an Xvfb virtual display (-gpu host). See SB #2418 for the proven recipe.
+const ANDROID_HOME = process.env["ANDROID_HOME"] || "/opt/android-sdk";
+const EMULATOR_PATH = `${ANDROID_HOME}/emulator/emulator`;
+const AVDMANAGER_PATH = `${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager`;
+const EMULATOR_AVD = process.env["EMULATOR_AVD"] || "mcp_emulator";
+const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;google_apis_playstore;x86_64";
+const EMULATOR_DISPLAY = process.env["EMULATOR_DISPLAY"] || ":0";
+const EMULATOR_BOOT_TIMEOUT_MS = 180_000; // 3 min to reach sys.boot_completed
+const AVD_NAME_REGEX = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
 
 // Repo allowlist matcher. An entry ending in "/*" allows any direct child
 // directory of that base (so new projects dropped under it build with no
@@ -177,12 +195,176 @@ function isRateLimited(): boolean {
 
 const activeRecordings = new Map<string, { proc: ReturnType<typeof spawn>; outputPath: string }>();
 
+// ── Emulator lifecycle (module scope — shared across /mcp requests in this process) ──
+
+// The Xvfb virtual display, and the emulators THIS server started (serial -> launcher process).
+let xvfbProc: ReturnType<typeof spawn> | null = null;
+const ownedEmulators = new Map<string, ReturnType<typeof spawn>>();
+// Boot mutex: at most one emulator boot in flight. Concurrent/rapid start calls await it instead of
+// spawning a second emulator (which would fight over the shared AVD lock + KVM/GPU).
+let startInFlight: Promise<string> | null = null;
+
+// Match the server's serial-validator ethos (no leading dash -> no arg-injection into avdmanager/emulator).
+function validateAvdName(name: string): void {
+  if (!name || name.length > 64 || !AVD_NAME_REGEX.test(name)) {
+    throw new Error(`Invalid AVD name: ${name}`);
+  }
+}
+
+// Env for emulator/avdmanager/Xvfb. Put the server's own adb dir first on PATH so the emulator uses
+// the SAME adb the server does (avoids adb client/server version skew with the host SDK adb).
+function emulatorEnv(): NodeJS.ProcessEnv {
+  const adbDir = ADB_PATH.includes("/") ? ADB_PATH.slice(0, ADB_PATH.lastIndexOf("/")) : "/usr/bin";
+  return {
+    ...process.env,
+    ANDROID_HOME,
+    ANDROID_SDK_ROOT: ANDROID_HOME,
+    DISPLAY: EMULATOR_DISPLAY,
+    PATH: `${adbDir}:${process.env["PATH"] || ""}:${ANDROID_HOME}/emulator`,
+  };
+}
+
+// Console ports adb currently knows about (ANY state). This is the ground-truth "did our emulator
+// actually register" signal — it must NOT include our own optimistic bookkeeping.
+async function adbKnownPorts(): Promise<Set<number>> {
+  const ports = new Set<number>();
+  try {
+    const { stdout } = await execFile(ADB_PATH, ["devices"], { timeout: ADB_TIMEOUT_MS });
+    for (const line of stdout.split("\n")) {
+      const m = line.trim().match(/^emulator-(\d+)\b/);
+      if (m) ports.add(Number(m[1]));
+    }
+  } catch { /* adb not up yet — only our owned ports matter for allocation */ }
+  return ports;
+}
+
+// Ports to AVOID when allocating a new serial: everything adb knows about PLUS the ones we own (which
+// may not have registered with adb yet) — so a new deterministic serial never collides.
+async function usedEmulatorPorts(): Promise<Set<number>> {
+  const ports = await adbKnownPorts();
+  for (const serial of ownedEmulators.keys()) {
+    const m = serial.match(/^emulator-(\d+)$/);
+    if (m) ports.add(Number(m[1]));
+  }
+  return ports;
+}
+
+// Lowest free even console port in the emulator range; throws if exhausted.
+async function pickEmulatorPort(): Promise<number> {
+  const used = await usedEmulatorPorts();
+  for (let port = 5554; port <= 5584; port += 2) {
+    if (!used.has(port)) return port;
+  }
+  throw new Error("no free emulator console port in 5554-5584");
+}
+
+async function isBooted(serial: string): Promise<boolean> {
+  const out = await adb(serial, "shell", "getprop", "sys.boot_completed").catch(() => "");
+  return out.trim() === "1";
+}
+
+// X socket path for the configured display (":0" -> /tmp/.X11-unix/X0).
+function xDisplaySocket(): string {
+  const n = EMULATOR_DISPLAY.replace(/^:/, "").split(".")[0];
+  return `/tmp/.X11-unix/X${n}`;
+}
+
+// Ensure an Xvfb virtual display exists for the emulator's -gpu host renderer. Idempotent: reuses a
+// live Xvfb (ours, or one already owning the display socket) instead of starting a colliding server.
+async function ensureXvfb(): Promise<void> {
+  if (xvfbProc && xvfbProc.exitCode === null) return;
+  if (existsSync(xDisplaySocket())) return;
+  const proc = spawn("Xvfb", [EMULATOR_DISPLAY, "-screen", "0", "1080x2400x24", "-nolisten", "tcp"], {
+    detached: true,
+    stdio: "ignore",
+    env: emulatorEnv(),
+  });
+  proc.on("error", () => { xvfbProc = null; });
+  proc.on("exit", () => { xvfbProc = null; });
+  proc.unref();
+  xvfbProc = proc;
+  await new Promise((r) => setTimeout(r, 2000));
+}
+
+async function avdExists(name: string): Promise<boolean> {
+  const { stdout } = await execFile(AVDMANAGER_PATH, ["list", "avd", "-c"], { timeout: 30_000, env: emulatorEnv() });
+  return stdout.split("\n").map((s) => s.trim()).includes(name);
+}
+
+// Create the AVD from the fixed system image (a server constant, never user input). Answers the
+// hardware-profile prompt with "no" via stdin, bounds the call with a timeout, and gives a clear hint
+// when the system image isn't installed in the host SDK.
+async function createAvd(name: string): Promise<void> {
+  await new Promise<void>((resolveP, rejectP) => {
+    const proc = spawn(AVDMANAGER_PATH, ["create", "avd", "-n", name, "-k", EMULATOR_SYSIMAGE, "--force"], { env: emulatorEnv() });
+    const timer = setTimeout(() => { proc.kill("SIGKILL"); rejectP(new Error("avdmanager create timed out after 60s")); }, 60_000);
+    let err = "";
+    proc.stderr.on("data", (d) => { err += d.toString(); });
+    proc.on("error", (e) => { clearTimeout(timer); rejectP(e); });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolveP();
+      const hint = /not\s+(installed|valid)|package path|could not be found/i.test(err)
+        ? ` — system image '${EMULATOR_SYSIMAGE}' may not be installed in the host SDK (install it with sdkmanager)`
+        : "";
+      rejectP(new Error(`avdmanager create failed (${code})${hint}: ${err.slice(0, 300)}`));
+    });
+    proc.stdin.write("no\n");
+    proc.stdin.end();
+  });
+}
+
+// Core boot routine (serialized by startInFlight). Reuses an emulator THIS server already booted;
+// otherwise assigns a deterministic free port, spawns the emulator, and polls its OWN serial.
+async function startEmulator(avd_name: string, cold_boot: boolean): Promise<string> {
+  // Reuse only an emulator we started (never hand back an externally-started one). Skip reuse for a
+  // cold boot — the caller explicitly wants fresh state, so honor it instead of returning the old VM.
+  if (!cold_boot) {
+    for (const [serial] of ownedEmulators) {
+      if (await isBooted(serial)) return `Emulator already running: ${serial} (boot_completed=1)`;
+    }
+  }
+
+  await ensureXvfb();
+  if (!(await avdExists(avd_name))) await createAvd(avd_name);
+
+  const port = await pickEmulatorPort();
+  const serial = `emulator-${port}`;
+  const args = ["-avd", avd_name, "-port", String(port), "-no-audio", "-no-boot-anim", "-no-snapshot", "-no-metrics", "-gpu", "host"];
+  if (cold_boot) args.push("-wipe-data");
+  const proc = spawn(EMULATOR_PATH, args, { detached: true, stdio: "ignore", env: emulatorEnv() });
+  proc.unref();
+  ownedEmulators.set(serial, proc);
+
+  const deadline = Date.now() + EMULATOR_BOOT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (await isBooted(serial)) return `Emulator booted: ${serial}`;
+    // Fast-fail only if the launcher exited AND the VM never registered with adb. Check adb's ground
+    // truth (adbKnownPorts), NOT usedEmulatorPorts — the latter includes our own just-reserved port and
+    // would make this branch unreachable. Don't trust the launcher's exit alone (some builds exit 0
+    // while qemu keeps running).
+    if (proc.exitCode !== null && !(await adbKnownPorts()).has(port)) {
+      proc.kill("SIGKILL");
+      ownedEmulators.delete(serial);
+      return `FAIL: emulator exited (code ${proc.exitCode}) and ${serial} never registered. Check /dev/kvm, /dev/dri access and Xvfb.`;
+    }
+  }
+  // Timed out. If it never registered with adb it is wedged — reap it so its port frees up; if it did
+  // register (still booting) leave it owned so android-emulator-stop can kill it.
+  if (!(await adbKnownPorts()).has(port)) {
+    proc.kill("SIGKILL");
+    ownedEmulators.delete(serial);
+  }
+  return `TIMEOUT: ${serial} did not reach boot_completed within ${EMULATOR_BOOT_TIMEOUT_MS / 1000}s`;
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   // --- Device management ---
@@ -196,6 +378,57 @@ function createServer(): McpServer {
         timeout: ADB_TIMEOUT_MS,
       });
       return { content: [{ type: "text" as const, text: stdout.trim() }] };
+    },
+  );
+
+  // --- Emulator lifecycle ---
+
+  const EmulatorStartInput = {
+    avd_name: z.string().min(1).max(64).default(EMULATOR_AVD).describe("AVD to boot (created from the default system image if missing)"),
+    cold_boot: z.boolean().default(false).describe("Wipe state and cold boot"),
+  };
+  server.tool(
+    "android-emulator-start",
+    "Start a headless, GPU-accelerated Android emulator on FRAME-DESK and wait until it finishes booting. Returns the emulator serial (e.g. emulator-5556) to pass to the other android-* tools. Idempotent and serialized: concurrent or repeated calls await a single in-flight boot rather than spawning duplicates, and only emulators this server started are reused. Requires /dev/kvm + /dev/dri and Xvfb in the container.",
+    EmulatorStartInput,
+    async ({ avd_name, cold_boot }) => {
+      validateAvdName(avd_name);
+      // Serialize: if a boot is already running, await it instead of spawning another emulator.
+      if (startInFlight) {
+        const text = await startInFlight.catch((e) => `previous start failed: ${e instanceof Error ? e.message : String(e)}`);
+        return { content: [{ type: "text" as const, text: `(boot already in progress) ${text}` }] };
+      }
+      startInFlight = startEmulator(avd_name, cold_boot);
+      try {
+        const text = await startInFlight;
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `FAIL: ${err instanceof Error ? err.message : String(err)}` }] };
+      } finally {
+        startInFlight = null;
+      }
+    },
+  );
+
+  const EmulatorStopInput = { device_serial: z.string().min(1).max(64).describe("Emulator serial returned by android-emulator-start") };
+  server.tool(
+    "android-emulator-stop",
+    "Stop an emulator THIS server started (adb emu kill). Refuses serials it did not start, so it can never kill an externally-started emulator. Tears down Xvfb once the last owned emulator stops.",
+    EmulatorStopInput,
+    async ({ device_serial }) => {
+      validateSerial(device_serial);
+      if (!/^emulator-\d+$/.test(device_serial)) throw new Error("android-emulator-stop only operates on emulator-* serials");
+      if (!ownedEmulators.has(device_serial)) {
+        const owned = [...ownedEmulators.keys()].join(", ") || "none";
+        throw new Error(`Refusing to stop ${device_serial}: not started by this server (owned: ${owned}). Use the originating session, or kill it manually.`);
+      }
+      const result = await adb(device_serial, "emu", "kill").catch((e) => String(e));
+      ownedEmulators.delete(device_serial);
+      if (ownedEmulators.size === 0 && xvfbProc) {
+        xvfbProc.kill("SIGTERM");
+        xvfbProc = null;
+      }
+      return { content: [{ type: "text" as const, text: `Stop ${device_serial}: ${result || "killed"}` }] };
     },
   );
 
@@ -1351,7 +1584,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 20");
+console.log("Tools: 24");
 
 process.on("SIGTERM", () => {
   httpServer.stop();

@@ -28,7 +28,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     adb \
     git \
     openssh-client \
+    xvfb xauth mesa-vulkan-drivers libvulkan1 \
+    libpulse0 libnss3 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+    libgbm1 libgl1 libx11-6 libxext6 libxcb1 libxkbcommon0 libasound2t64 \
     && rm -rf /var/lib/apt/lists/*
+
+# GPU/KVM device access for the emulator (-gpu host via /dev/dri) is granted entirely at runtime by
+# the quadlet (which overrides this image's USER with User=1001 and passes the host runner's real
+# render/video/android GIDs via --group-add keep-groups + AddDevice=/dev/kvm,/dev/dri). No in-image
+# group membership is needed or effective, so none is added here.
 
 ENV JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64
 
