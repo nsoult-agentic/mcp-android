@@ -15,6 +15,8 @@
  *   android-list-builds        — List APKs/AABs in /data/builds/
  *   android-screenshot         — Capture screenshot from device/emulator
  *   android-build              — Trigger gradle build, output to /data/builds/
+ *   android-instrumented-test  — Start on-device tests via Gradle Managed Devices (returns job_id)
+ *   android-test-status        — Poll an instrumented-test job (state + log tail)
  *   android-list-files         — List files in /data/builds/ (screenshots, APKs)
  *   android-download           — Download file from /data/builds/ as base64
  *   android-tap                — Tap at screen coordinates
@@ -39,10 +41,11 @@
 import { resolve } from "node:path";
 import { execFile as execFileCb, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdirSync, copyFileSync, realpathSync, existsSync } from "node:fs";
+import { mkdirSync, copyFileSync, realpathSync, existsSync, openSync, closeSync, writeFileSync, readFileSync, chmodSync, renameSync } from "node:fs";
 import { readdir, stat, readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename } from "node:path";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
@@ -77,6 +80,9 @@ const EMULATOR_AVD = process.env["EMULATOR_AVD"] || "mcp_emulator";
 const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;google_apis_playstore;x86_64";
 const EMULATOR_DISPLAY = process.env["EMULATOR_DISPLAY"] || ":0";
 const EMULATOR_BOOT_TIMEOUT_MS = 180_000; // 3 min to reach sys.boot_completed
+// GMD may install the system image, provision + boot a managed emulator, then run the tests — give
+// it a generous ceiling (a cold first run downloads Gradle/deps too).
+const INSTRUMENTED_TEST_TIMEOUT_MS = 1_800_000; // 30 minutes
 const AVD_NAME_REGEX = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
 
 // Repo allowlist matcher. An entry ending in "/*" allows any direct child
@@ -359,12 +365,44 @@ async function startEmulator(avd_name: string, cold_boot: boolean): Promise<stri
   return `TIMEOUT: ${serial} did not reach boot_completed within ${EMULATOR_BOOT_TIMEOUT_MS / 1000}s`;
 }
 
+// ── Async instrumented-test jobs ───────────────────────────
+// GMD instrumented runs take minutes — longer than the HTTP idle timeout (Bun caps at 255s). So they
+// run as DETACHED background jobs: the tool returns a job_id immediately and writes a status file + log
+// under /data/builds; android-test-status polls them. One GMD run at a time (a single shared
+// emulator/AVD/Xvfb/adbkey). Module-scoped state survives across the per-request McpServer instances.
+interface InstrumentedJob { proc: ReturnType<typeof spawn>; timer: ReturnType<typeof setTimeout>; }
+const instrumentedJobs = new Map<string, InstrumentedJob>();
+const JOB_ID_REGEX = /^[0-9a-fA-F-]{8,64}$/;
+
+// Redact sensitive key=value pairs AND bare keystore/credential file paths from text returned to the
+// caller (gradle signing errors print bare *.jks/*.keystore paths that a keyword=value regex misses).
+function redactSensitive(s: string): string {
+  const VALUE = /(?:password|apiKey|api_key|token|secret|credentials|keystore|store_password|key_password|key_alias)\s*[=:]\s*\S+/gi;
+  const KEYFILE = /\b[^\s'"]+\.(?:jks|keystore|p12|pfx|pem|key)\b/gi;
+  return s.split("\n").map((line) =>
+    line
+      .replace(VALUE, (m) => { const sep = m.includes("=") ? "=" : ":"; return `${m.split(/[=:]/)[0]}${sep}[REDACTED]`; })
+      .replace(KEYFILE, "[REDACTED-KEYFILE]"),
+  ).join("\n");
+}
+
+function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
+  // Write-temp-then-rename so a concurrent android-test-status poll never reads a half-written file
+  // (rename is atomic within the single /data/builds mount).
+  try {
+    const final = `${ALLOWED_INSTALL_DIR}/${jobId}.status.json`;
+    const tmp = `${final}.tmp`;
+    writeFileSync(tmp, JSON.stringify(status, null, 2));
+    renameSync(tmp, final);
+  } catch { /* best-effort */ }
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   // --- Device management ---
@@ -839,6 +877,188 @@ function createServer(): McpServer {
         const msg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: "text" as const, text: `Build failed: ${msg.slice(0, 500)}` }] };
       }
+    },
+  );
+
+  // ── Tool: android-instrumented-test ─────────────────────────
+  // START an on-device (instrumented) test run via Gradle Managed Devices and return a job_id at once.
+  // GMD provisions + boots a headless emulator (-gpu host into the server's Xvfb display) and runs
+  // :<module>:<device>DebugAndroidTest — which takes minutes, longer than the HTTP idle timeout — so the
+  // gradle build runs as a DETACHED background process writing to /data/builds/<job_id>.{log,status.json};
+  // poll with android-test-status. One run at a time (shared emulator/AVD/Xvfb/adbkey). adb authorization
+  // needs a stable $HOME-resolvable adbkey (rootless keep-id fix — SB #2424). The managed device's system
+  // image must be pre-installed in the host SDK — GMD writes only the managed AVD (under ANDROID_AVD_HOME).
+  const InstrumentedTestInput = {
+    repo_path: z
+      .string()
+      .min(1)
+      .max(200)
+      .describe(`Absolute path to the Android repo (allowed: ${ALLOWED_BUILD_REPOS.join(", ")})`),
+    device: z
+      .string()
+      .min(1)
+      .max(40)
+      .default("aospAtd")
+      .describe("GMD managed-device name as declared in the module's testOptions.managedDevices (default: aospAtd)"),
+    gradle_module: z
+      .string()
+      .min(1)
+      .max(40)
+      .default("app")
+      .describe("Gradle module holding the managed device + androidTest sources (default: app)"),
+    gpu: z
+      .enum(["host", "swiftshader_indirect", "auto", "swiftshader", "guest"])
+      .default("host")
+      .describe("Emulator GPU mode for GMD (default: host — required on this AMD iGPU; swiftshader software-Vulkan crashes on RADV)"),
+  };
+  server.tool(
+    "android-instrumented-test",
+    `Start on-device (instrumented) tests via Gradle Managed Devices and return a job_id immediately — the run takes minutes, so poll android-test-status with the job_id. Provisions + boots a headless emulator and runs :<module>:<device>DebugAndroidTest. The managed device (e.g. "aospAtd") must be declared in the module's testOptions.managedDevices and its system image pre-installed in the host SDK. One run at a time. Requires /dev/kvm + /dev/dri + Xvfb. Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}.`,
+    InstrumentedTestInput,
+    async ({ repo_path, device, gradle_module, gpu }) => {
+      try {
+        // device + module are interpolated into the gradle task name, so they must be strict
+        // alphanumerics (no leading dash, no separators) — prevents task/arg injection.
+        const ID_REGEX = /^[A-Za-z][A-Za-z0-9]*$/;
+        if (!ID_REGEX.test(device)) {
+          return { content: [{ type: "text" as const, text: `Error: invalid device name '${device}' (must be alphanumeric)` }] };
+        }
+        if (!ID_REGEX.test(gradle_module)) {
+          return { content: [{ type: "text" as const, text: `Error: invalid module name '${gradle_module}' (must be alphanumeric)` }] };
+        }
+
+        // Validate repo path against allowlist (realpathSync resolves symlinks on both sides).
+        let resolvedRepo: string;
+        try {
+          resolvedRepo = realpathSync(repo_path);
+        } catch {
+          return { content: [{ type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` }] };
+        }
+        if (!isAllowedBuildRepo(resolvedRepo)) {
+          return { content: [{ type: "text" as const, text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` }] };
+        }
+
+        // One GMD run at a time — concurrent runs would contend on the single shared emulator/AVD/Xvfb/adbkey.
+        if (instrumentedJobs.size > 0) {
+          return { content: [{ type: "text" as const, text: `A GMD instrumented-test run is already in progress (job ${[...instrumentedJobs.keys()].join(", ")}). Poll android-test-status and retry once it finishes.` }] };
+        }
+
+        // GMD launches the emulator with -gpu host, which needs an X display.
+        await ensureXvfb();
+
+        // Ensure a stable adb key resolvable via $HOME so GMD's adb authorizes the managed emulator
+        // (rootless keep-id "device unauthorized" fix — SB #2424). Idempotent; non-fatal on failure.
+        const homeDir = process.env["HOME"] || "/srv/android/home";
+        const adbKeyPath = `${homeDir}/.android/adbkey`;
+        if (!existsSync(adbKeyPath)) {
+          try {
+            mkdirSync(`${homeDir}/.android`, { recursive: true });
+            await execFile(ADB_PATH, ["keygen", adbKeyPath], { timeout: ADB_TIMEOUT_MS });
+            try { chmodSync(adbKeyPath, 0o600); } catch { /* best-effort: key is owner-only */ }
+          } catch (e) {
+            // Non-fatal: GMD/adb may still auto-generate. But log it — a failure here (e.g. $HOME not
+            // writable under rootless keep-id) is the exact cause of a downstream "device unauthorized".
+            console.error(`adbkey ensure failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+
+        const task = `:${gradle_module}:${device}DebugAndroidTest`;
+        const env: NodeJS.ProcessEnv = {
+          ...emulatorEnv(),               // ANDROID_HOME/SDK_ROOT + DISPLAY=:0 + adb-first PATH
+          QT_QPA_PLATFORM: "offscreen",   // GMD runs -no-window; avoid the Qt xcb plugin (no libxcb-cursor0)
+          ADB_VENDOR_KEYS: adbKeyPath,
+          // Pin GMD's managed-AVD location explicitly rather than silently relying on inherited quadlet env.
+          ANDROID_AVD_HOME: process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
+          ANDROID_USER_HOME: process.env["ANDROID_USER_HOME"] || process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
+        };
+
+        const jobId = randomUUID();
+        const logPath = `${ALLOWED_INSTALL_DIR}/${jobId}.log`;
+        const startedAt = new Date().toISOString();
+        const meta = { jobId, task, device, gpu, repo: resolvedRepo, startedAt };
+        writeJobStatus(jobId, { ...meta, state: "running" });
+
+        // Detached background run; stdout+stderr stream to the job log file (no maxBuffer cap).
+        // --console=plain trims the GMD/gradle log volume. The McpServer for this request is discarded
+        // after we return, but the child + its exit handler live on the long-lived module scope.
+        const logFd = openSync(logPath, "a");
+        // Close the log fd exactly once across whichever terminal path fires (exit/error/timeout) — a
+        // second closeSync on a reused fd integer could close an unrelated file.
+        let fdOpen = true;
+        const closeLog = (): void => { if (fdOpen) { fdOpen = false; try { closeSync(logFd); } catch { /* */ } } };
+        let proc: ReturnType<typeof spawn>;
+        try {
+          proc = spawn(
+            `${resolvedRepo}/gradlew`,
+            [task, `-Pandroid.testoptions.manageddevices.emulator.gpu=${gpu}`, "--no-daemon", "--console=plain"],
+            { cwd: resolvedRepo, env, stdio: ["ignore", logFd, logFd] },
+          );
+        } catch (spawnErr) {
+          closeLog(); // spawn threw synchronously (bad opts/EMFILE) — don't leak the fd
+          throw spawnErr;
+        }
+        const timer = setTimeout(() => {
+          proc.kill("SIGTERM");
+          instrumentedJobs.delete(jobId);
+          closeLog();
+          writeJobStatus(jobId, { ...meta, state: "timeout", endedAt: new Date().toISOString(),
+            note: `killed after ${INSTRUMENTED_TEST_TIMEOUT_MS / 60000}min; a GMD-managed emulator may be orphaned — check android-list-devices` });
+        }, INSTRUMENTED_TEST_TIMEOUT_MS);
+        proc.on("exit", (code) => {
+          clearTimeout(timer);
+          closeLog();
+          if (!instrumentedJobs.has(jobId)) return; // already finalized (e.g. by the timeout)
+          instrumentedJobs.delete(jobId);
+          writeJobStatus(jobId, { ...meta, state: code === 0 ? "passed" : "failed", exitCode: code, endedAt: new Date().toISOString(),
+            reportDir: `${gradle_module}/build/reports/androidTests/managedDevice/` });
+        });
+        proc.on("error", (e) => {
+          clearTimeout(timer);
+          closeLog();
+          instrumentedJobs.delete(jobId);
+          writeJobStatus(jobId, { ...meta, state: "error", error: e instanceof Error ? e.message : String(e), endedAt: new Date().toISOString() });
+        });
+        instrumentedJobs.set(jobId, { proc, timer });
+
+        return { content: [{ type: "text" as const, text:
+          `Started instrumented-test job ${jobId}\n  ${task} on '${device}', gpu=${gpu}\nPoll: android-test-status job_id="${jobId}"\nStatus/log: ${ALLOWED_INSTALL_DIR}/${jobId}.{status.json,log}` }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: `Failed to start instrumented test: ${msg.slice(0, 500)}` }] };
+      }
+    },
+  );
+
+  // ── Tool: android-test-status ───────────────────────────────
+  // Poll an android-instrumented-test job: returns its state + log tail. A "running" status file with no
+  // live in-process job means the server restarted mid-run (result unknown — re-run).
+  const TestStatusInput = {
+    job_id: z.string().min(8).max(64).describe("Job id returned by android-instrumented-test"),
+  };
+  server.tool(
+    "android-test-status",
+    "Poll the status of an android-instrumented-test job: returns its state (running/passed/failed/timeout/error/interrupted) plus the tail of its log. Use the job_id returned by android-instrumented-test.",
+    TestStatusInput,
+    async ({ job_id }) => {
+      if (!JOB_ID_REGEX.test(job_id)) {
+        return { content: [{ type: "text" as const, text: `Error: invalid job_id '${job_id}'` }] };
+      }
+      const statusPath = `${ALLOWED_INSTALL_DIR}/${job_id}.status.json`;
+      const logPath = `${ALLOWED_INSTALL_DIR}/${job_id}.log`;
+      if (!existsSync(statusPath)) {
+        return { content: [{ type: "text" as const, text: `No such job: ${job_id}` }] };
+      }
+      let statusObj: Record<string, unknown> | null = null;
+      try { statusObj = JSON.parse(readFileSync(statusPath, "utf8")); } catch { /* unreadable/partial */ }
+      // A persisted "running" job that this process is NOT tracking means the server restarted mid-run.
+      if (statusObj && statusObj["state"] === "running" && !instrumentedJobs.has(job_id)) {
+        statusObj["state"] = "interrupted";
+        statusObj["note"] = "server restarted during the run; result unknown — re-run the test";
+      }
+      const statusText = statusObj ? JSON.stringify(statusObj, null, 2) : "(unreadable status file)";
+      let logTail = "(no log yet)";
+      try { logTail = redactSensitive(readFileSync(logPath, "utf8")).slice(-4000); } catch { /* no log yet */ }
+      return { content: [{ type: "text" as const, text: `${statusText}\n\nLog tail (last 4000 chars):\n${logTail}` }] };
     },
   );
 
@@ -1584,7 +1804,7 @@ const httpServer = Bun.serve({
 });
 
 console.log(`mcp-android listening on http://0.0.0.0:${PORT}/mcp`);
-console.log("Tools: 24");
+console.log("Tools: 26");
 
 process.on("SIGTERM", () => {
   httpServer.stop();
