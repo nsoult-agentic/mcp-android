@@ -77,11 +77,12 @@ const ANDROID_HOME = process.env["ANDROID_HOME"] || "/opt/android-sdk";
 const EMULATOR_PATH = `${ANDROID_HOME}/emulator/emulator`;
 const AVDMANAGER_PATH = `${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager`;
 const EMULATOR_AVD = process.env["EMULATOR_AVD"] || "mcp_emulator";
-// aosp_atd (Automated Test Device): test-keys/userdebug → adb AUTO-AUTHORIZES headless and boots fast.
-// A google_apis_playstore (release-keys, production) image CANNOT be adb-authorized headless (it needs
-// the on-screen "Allow USB debugging" dialog) and won't cold-boot cheaply — that was the real bug, not
-// adb keys (SB #2427). This is the same image the GMD path already uses successfully. Pre-seed it in the SDK.
-const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;aosp_atd;x86_64";
+// google_apis (NON-playstore phone): test-keys/userdebug → adb AUTO-AUTHORIZES headless AND it RENDERS,
+// so screenshots actually show the app. By contrast: aosp_atd auto-authorizes but is test-only and
+// renders BLACK (right for GMD instrumented tests, wrong for visual); google_apis_playstore (release-keys)
+// can't be adb-authorized headless at all. This tool drives the interactive/visual workflow, so it needs
+// the rendering image (SB #2427/#2428). Pre-seed it in the SDK.
+const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;google_apis;x86_64";
 const EMULATOR_DEVICE = process.env["EMULATOR_DEVICE"] || "pixel_5";
 const EMULATOR_DISPLAY = process.env["EMULATOR_DISPLAY"] || ":0";
 const EMULATOR_BOOT_TIMEOUT_MS = 180_000; // 3 min to reach sys.boot_completed
@@ -442,7 +443,7 @@ function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.6.3",
+    version: "0.6.4",
   });
 
   // --- Device management ---
