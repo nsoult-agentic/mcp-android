@@ -402,7 +402,7 @@ function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.6.0",
+    version: "0.6.1",
   });
 
   // --- Device management ---
@@ -943,9 +943,6 @@ function createServer(): McpServer {
           return { content: [{ type: "text" as const, text: `A GMD instrumented-test run is already in progress (job ${[...instrumentedJobs.keys()].join(", ")}). Poll android-test-status and retry once it finishes.` }] };
         }
 
-        // GMD launches the emulator with -gpu host, which needs an X display.
-        await ensureXvfb();
-
         // Ensure a stable adb key resolvable via $HOME so GMD's adb authorizes the managed emulator
         // (rootless keep-id "device unauthorized" fix — SB #2424). Idempotent; non-fatal on failure.
         const homeDir = process.env["HOME"] || "/srv/android/home";
@@ -971,6 +968,10 @@ function createServer(): McpServer {
           ANDROID_AVD_HOME: process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
           ANDROID_USER_HOME: process.env["ANDROID_USER_HOME"] || process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
         };
+        // Run under xvfb-run (below), which provides DISPLAY + a matching Xauthority cookie. Drop the
+        // inherited DISPLAY=:0 (from emulatorEnv): a bare `Xvfb :0` has no xauth, so GMD's -gpu host
+        // emulator fails with "GPU cannot be used for hardware rendering" (validated against the prod SDK).
+        delete env["DISPLAY"];
 
         const jobId = randomUUID();
         const logPath = `${ALLOWED_INSTALL_DIR}/${jobId}.log`;
@@ -988,9 +989,12 @@ function createServer(): McpServer {
         const closeLog = (): void => { if (fdOpen) { fdOpen = false; try { closeSync(logFd); } catch { /* */ } } };
         let proc: ReturnType<typeof spawn>;
         try {
+          // xvfb-run -a allocates a fresh virtual display WITH an Xauthority cookie and runs gradle under
+          // it; GMD's -gpu host emulator renders into that authed display. (Bare Xvfb without xauth fails.)
           proc = spawn(
-            `${resolvedRepo}/gradlew`,
-            [task, `-Pandroid.testoptions.manageddevices.emulator.gpu=${gpu}`, "--no-daemon", "--console=plain"],
+            "xvfb-run",
+            ["-a", "-s", "-screen 0 1280x800x24",
+              `${resolvedRepo}/gradlew`, task, `-Pandroid.testoptions.manageddevices.emulator.gpu=${gpu}`, "--no-daemon", "--console=plain"],
             { cwd: resolvedRepo, env, stdio: ["ignore", logFd, logFd] },
           );
         } catch (spawnErr) {
