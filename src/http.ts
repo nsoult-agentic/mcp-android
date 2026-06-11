@@ -77,7 +77,12 @@ const ANDROID_HOME = process.env["ANDROID_HOME"] || "/opt/android-sdk";
 const EMULATOR_PATH = `${ANDROID_HOME}/emulator/emulator`;
 const AVDMANAGER_PATH = `${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager`;
 const EMULATOR_AVD = process.env["EMULATOR_AVD"] || "mcp_emulator";
-const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;google_apis_playstore;x86_64";
+// aosp_atd (Automated Test Device): test-keys/userdebug → adb AUTO-AUTHORIZES headless and boots fast.
+// A google_apis_playstore (release-keys, production) image CANNOT be adb-authorized headless (it needs
+// the on-screen "Allow USB debugging" dialog) and won't cold-boot cheaply — that was the real bug, not
+// adb keys (SB #2427). This is the same image the GMD path already uses successfully. Pre-seed it in the SDK.
+const EMULATOR_SYSIMAGE = process.env["EMULATOR_SYSIMAGE"] || "system-images;android-35;aosp_atd;x86_64";
+const EMULATOR_DEVICE = process.env["EMULATOR_DEVICE"] || "pixel_5";
 const EMULATOR_DISPLAY = process.env["EMULATOR_DISPLAY"] || ":0";
 const EMULATOR_BOOT_TIMEOUT_MS = 180_000; // 3 min to reach sys.boot_completed
 // GMD may install the system image, provision + boot a managed emulator, then run the tests — give
@@ -205,6 +210,8 @@ const activeRecordings = new Map<string, { proc: ReturnType<typeof spawn>; outpu
 
 // The Xvfb virtual display, and the emulators THIS server started (serial -> launcher process).
 let xvfbProc: ReturnType<typeof spawn> | null = null;
+// The display ensureXvfb actually started on (may differ from EMULATOR_DISPLAY if :0 was poisoned).
+let activeDisplay: string = EMULATOR_DISPLAY;
 const ownedEmulators = new Map<string, ReturnType<typeof spawn>>();
 // Boot mutex: at most one emulator boot in flight. Concurrent/rapid start calls await it instead of
 // spawning a second emulator (which would fight over the shared AVD lock + KVM/GPU).
@@ -225,7 +232,7 @@ function emulatorEnv(): NodeJS.ProcessEnv {
     ...process.env,
     ANDROID_HOME,
     ANDROID_SDK_ROOT: ANDROID_HOME,
-    DISPLAY: EMULATOR_DISPLAY,
+    DISPLAY: activeDisplay,
     // Headless: the emulator runs -no-window; offscreen Qt avoids needing libxcb-cursor0.
     QT_QPA_PLATFORM: "offscreen",
     // adb authorizes the emulator via a $HOME-resolvable key (rootless keep-id fix — SB #2424).
@@ -282,21 +289,34 @@ function xDisplaySocket(): string {
 // Ensure an Xvfb virtual display exists for the emulator's -gpu host renderer. Idempotent: reuses a
 // live Xvfb (ours, or one already owning the display socket) instead of starting a colliding server.
 async function ensureXvfb(): Promise<void> {
+  // Reuse only if OUR Xvfb process is still alive — socket-file existence is NOT liveness (a stale
+  // socket from a dead server would make the emulator fail "Failed to open display").
   if (xvfbProc && xvfbProc.exitCode === null) return;
-  if (existsSync(xDisplaySocket())) return;
-  // -ac disables X access control so the emulator connects without an Xauthority cookie (a bare Xvfb
-  // with auth required → "Authorization required" / "GPU cannot be used for hardware rendering").
-  // Local display only (-nolisten tcp) in a single-user container.
-  const proc = spawn("Xvfb", [EMULATOR_DISPLAY, "-screen", "0", "1080x2400x24", "-nolisten", "tcp", "-ac"], {
-    detached: true,
-    stdio: "ignore",
-    env: emulatorEnv(),
-  });
-  proc.on("error", () => { xvfbProc = null; });
-  proc.on("exit", () => { xvfbProc = null; });
-  proc.unref();
-  xvfbProc = proc;
-  await new Promise((r) => setTimeout(r, 2000));
+  // Xvfb running as non-root REFUSES to create /tmp/.X11-unix (euid != 0 → "directory will not be
+  // created"), so create it ourselves (sticky 1777; we own it, which is enough for Xvfb to USE it).
+  try { mkdirSync("/tmp/.X11-unix", { recursive: true, mode: 0o1777 }); } catch { /* best-effort */ }
+  // A persistent rootless container can leave display :0 poisoned by an orphaned abstract socket
+  // (unremovable from userspace), so try a range and verify each Xvfb actually came up before using it.
+  for (let n = 0; n <= 24; n++) {
+    const disp = `:${n}`;
+    const sock = `/tmp/.X11-unix/X${n}`;
+    if (existsSync(sock)) continue; // occupied or stale — skip to a clean display number
+    // -ac: no Xauthority cookie needed; -nolisten tcp: local only (single-user container).
+    const proc = spawn("Xvfb", [disp, "-screen", "0", "1080x2400x24", "-nolisten", "tcp", "-ac"], {
+      detached: true, stdio: "ignore", env: { ...process.env, DISPLAY: disp },
+    });
+    await new Promise((r) => setTimeout(r, 2500));
+    if (proc.exitCode === null && existsSync(sock)) {
+      proc.on("error", () => { xvfbProc = null; });
+      proc.on("exit", () => { xvfbProc = null; });
+      proc.unref();
+      xvfbProc = proc;
+      activeDisplay = disp;
+      return;
+    }
+    try { proc.kill("SIGKILL"); } catch { /* */ }
+  }
+  throw new Error("ensureXvfb: could not start Xvfb on any display in :0-:24");
 }
 
 async function avdExists(name: string): Promise<boolean> {
@@ -309,7 +329,7 @@ async function avdExists(name: string): Promise<boolean> {
 // when the system image isn't installed in the host SDK.
 async function createAvd(name: string): Promise<void> {
   await new Promise<void>((resolveP, rejectP) => {
-    const proc = spawn(AVDMANAGER_PATH, ["create", "avd", "-n", name, "-k", EMULATOR_SYSIMAGE, "--force"], { env: emulatorEnv() });
+    const proc = spawn(AVDMANAGER_PATH, ["create", "avd", "-n", name, "-k", EMULATOR_SYSIMAGE, "-d", EMULATOR_DEVICE, "--force"], { env: emulatorEnv() });
     const timer = setTimeout(() => { proc.kill("SIGKILL"); rejectP(new Error("avdmanager create timed out after 60s")); }, 60_000);
     let err = "";
     proc.stderr.on("data", (d) => { err += d.toString(); });
@@ -422,7 +442,7 @@ function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.6.2",
+    version: "0.6.3",
   });
 
   // --- Device management ---
