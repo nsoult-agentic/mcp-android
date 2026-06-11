@@ -226,6 +226,10 @@ function emulatorEnv(): NodeJS.ProcessEnv {
     ANDROID_HOME,
     ANDROID_SDK_ROOT: ANDROID_HOME,
     DISPLAY: EMULATOR_DISPLAY,
+    // Headless: the emulator runs -no-window; offscreen Qt avoids needing libxcb-cursor0.
+    QT_QPA_PLATFORM: "offscreen",
+    // adb authorizes the emulator via a $HOME-resolvable key (rootless keep-id fix — SB #2424).
+    ADB_VENDOR_KEYS: `${process.env["HOME"] || "/srv/android/home"}/.android/adbkey`,
     PATH: `${adbDir}:${process.env["PATH"] || ""}:${ANDROID_HOME}/emulator`,
   };
 }
@@ -280,7 +284,10 @@ function xDisplaySocket(): string {
 async function ensureXvfb(): Promise<void> {
   if (xvfbProc && xvfbProc.exitCode === null) return;
   if (existsSync(xDisplaySocket())) return;
-  const proc = spawn("Xvfb", [EMULATOR_DISPLAY, "-screen", "0", "1080x2400x24", "-nolisten", "tcp"], {
+  // -ac disables X access control so the emulator connects without an Xauthority cookie (a bare Xvfb
+  // with auth required → "Authorization required" / "GPU cannot be used for hardware rendering").
+  // Local display only (-nolisten tcp) in a single-user container.
+  const proc = spawn("Xvfb", [EMULATOR_DISPLAY, "-screen", "0", "1080x2400x24", "-nolisten", "tcp", "-ac"], {
     detached: true,
     stdio: "ignore",
     env: emulatorEnv(),
@@ -332,11 +339,24 @@ async function startEmulator(avd_name: string, cold_boot: boolean): Promise<stri
   }
 
   await ensureXvfb();
+  // Stable adb key resolvable via $HOME so adb authorizes the emulator (rootless keep-id fix — SB #2424).
+  const emuHome = process.env["HOME"] || "/srv/android/home";
+  const adbKeyPath = `${emuHome}/.android/adbkey`;
+  if (!existsSync(adbKeyPath)) {
+    try {
+      mkdirSync(`${emuHome}/.android`, { recursive: true });
+      await execFile(ADB_PATH, ["keygen", adbKeyPath], { timeout: ADB_TIMEOUT_MS });
+      try { chmodSync(adbKeyPath, 0o600); } catch { /* best-effort */ }
+    } catch (e) {
+      console.error(`adbkey ensure failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   if (!(await avdExists(avd_name))) await createAvd(avd_name);
 
   const port = await pickEmulatorPort();
   const serial = `emulator-${port}`;
-  const args = ["-avd", avd_name, "-port", String(port), "-no-audio", "-no-boot-anim", "-no-snapshot", "-no-metrics", "-gpu", "host"];
+  // -no-window: render into the Xvfb display without a Qt UI window (avoids the missing libxcb-cursor0).
+  const args = ["-avd", avd_name, "-port", String(port), "-no-audio", "-no-boot-anim", "-no-snapshot", "-no-metrics", "-gpu", "host", "-no-window"];
   if (cold_boot) args.push("-wipe-data");
   const proc = spawn(EMULATOR_PATH, args, { detached: true, stdio: "ignore", env: emulatorEnv() });
   proc.unref();
@@ -402,7 +422,7 @@ function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
 function createServer(): McpServer {
   const server = new McpServer({
     name: "mcp-android",
-    version: "0.6.1",
+    version: "0.6.2",
   });
 
   // --- Device management ---
