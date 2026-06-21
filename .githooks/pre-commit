@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Native git pre-commit → deterministic quality gate. Fires on ANY `git commit`
+# in this repo (interactive agent, subagent, gitsync, or manual) — unlike the
+# Claude Code PreToolUse hook, which doesn't fire inside subagents. Self-skips
+# non-gated repos and when nothing TS is staged. Bypass: QUALITY_GATE_SKIP=1.
+exec bash "$HOME/git/agents/_system/hooks/quality-gate.sh" "$(git rev-parse --show-toplevel 2>/dev/null)"
