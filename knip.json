@@ -2,7 +2,6 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["src/http.ts"],
   "project": ["src/**/*.ts"],
-  "ignoreDependencies": ["@biomejs/biome"],
   "ignoreUnresolved": ["bun-types"],
   "ignoreBinaries": ["Xvfb"],
   "rules": {
