@@ -54,6 +54,7 @@ import {
   renameSync,
 } from "node:fs";
 import { readdir, stat, readFile, unlink } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -148,6 +149,87 @@ function isAllowedBuildRepo(resolvedRepo: string): boolean {
       return false;
     }
   });
+}
+
+// Resolve a user-supplied repo path to its real path and confirm it is on the build
+// allowlist. Returns the resolved repo, or an error string describing why it was rejected
+// (path missing / not allowlisted) — callers turn that into a tool error response.
+function resolveAllowedRepo(repoPath: string): { repo: string } | { error: string } {
+  let resolvedRepo: string;
+  try {
+    resolvedRepo = realpathSync(repoPath);
+  } catch {
+    return { error: `Error: repo path does not exist: ${repoPath}` };
+  }
+  if (!isAllowedBuildRepo(resolvedRepo)) {
+    return { error: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}` };
+  }
+  return { repo: resolvedRepo };
+}
+
+// A non-zero `gradlew <task>` exit. Surface stdout+stderr (redacted) so the caller sees
+// WHICH tests/compile step failed — not just "Command failed". Returns the formatted tail.
+function formatGradleFailure(runErr: unknown, isTestTask: boolean): string {
+  const e = runErr as { stdout?: string; stderr?: string; message?: string };
+  const combined = redactSensitive(`${e.stdout || ""}\n${e.stderr || ""}`).trim();
+  const tail = (
+    combined.length > 0 ? combined : redactSensitive(e.message || String(runErr))
+  ).slice(-4000);
+  const label = isTestTask ? "Tests failed" : "Build failed";
+  return `${label} (gradle exit non-zero):\n\n${tail}`;
+}
+
+// After a successful assemble*/bundle* gradle run, locate the output dir, copy the produced
+// .apk/.aab artifacts into ALLOWED_INSTALL_DIR, and format the result text.
+async function reportAssembleBundle(
+  task: string,
+  resolvedRepo: string,
+  stdout: string,
+  stderr: string,
+): Promise<string> {
+  const isBundle = task.startsWith("bundle");
+  const variant = task.replace(/^(assemble|bundle)/, "").toLowerCase();
+  const ext = isBundle ? "aab" : "apk";
+  const outputDir = isBundle
+    ? `${resolvedRepo}/app/build/outputs/bundle/${variant}`
+    : `${resolvedRepo}/app/build/outputs/apk/${variant}`;
+
+  const copied = await copyBuildArtifacts(outputDir, ext, resolvedRepo);
+  const buildOutput = redactSensitive(stderr || stdout).slice(-500);
+  return copied.length > 0
+    ? `Build succeeded.\n\nCopied to /data/builds/:\n${copied.map((c) => `- ${c}`).join("\n")}\n\nBuild output (last 500 chars):\n${buildOutput}`
+    : `Build completed but no .${ext} files found in ${outputDir}\n\nBuild output (last 500 chars):\n${buildOutput}`;
+}
+
+// Copy the build artifacts (.apk/.aab) produced by an assemble/bundle task from the repo's
+// output dir into ALLOWED_INSTALL_DIR. Symlink-confined to the repo (escape guard). Returns
+// the list of destination paths copied; a missing output dir (ENOENT) yields an empty list,
+// any other readdir/copy error is appended as a "(warning: …)" line.
+async function copyBuildArtifacts(
+  outputDir: string,
+  ext: string,
+  resolvedRepo: string,
+): Promise<string[]> {
+  const copied: string[] = [];
+  try {
+    const files = await readdir(outputDir);
+    for (const f of files) {
+      if (!f.endsWith(`.${ext}`)) continue;
+      const src = realpathSync(resolve(outputDir, f));
+      // Guard: source must be within the repo to prevent symlink escape
+      if (!src.startsWith(`${resolvedRepo}/`)) continue;
+      const dest = `${ALLOWED_INSTALL_DIR}/${f}`;
+      copyFileSync(src, dest);
+      copied.push(dest);
+    }
+  } catch (copyErr: unknown) {
+    // Output dir might not exist for some tasks; log real errors
+    const copyMsg = copyErr instanceof Error ? copyErr.message : "";
+    if (!copyMsg.includes("ENOENT")) {
+      copied.push(`(warning: ${copyMsg.slice(0, 100)})`);
+    }
+  }
+  return copied;
 }
 
 // ── Validation ─────────────────────────────────────────────
@@ -489,6 +571,199 @@ function writeJobStatus(jobId: string, status: Record<string, unknown>): void {
   } catch {
     /* best-effort */
   }
+}
+
+// Build the environment for a GMD instrumented-test run. Starts from emulatorEnv() then pins the
+// adbkey + the managed-AVD location, and drops DISPLAY so xvfb-run can supply an authed display
+// (a bare Xvfb without xauth makes GMD's -gpu host emulator fail "GPU cannot be used …").
+function buildGmdEnv(adbKeyPath: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...emulatorEnv(), // ANDROID_HOME/SDK_ROOT + DISPLAY=:0 + adb-first PATH
+    QT_QPA_PLATFORM: "offscreen", // GMD runs -no-window; avoid the Qt xcb plugin (no libxcb-cursor0)
+    ADB_VENDOR_KEYS: adbKeyPath,
+    // Pin GMD's managed-AVD location explicitly rather than silently relying on inherited quadlet env.
+    ANDROID_AVD_HOME: process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
+    ANDROID_USER_HOME:
+      process.env["ANDROID_USER_HOME"] || process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
+  };
+  delete env["DISPLAY"];
+  return env;
+}
+
+// device + module are interpolated into the gradle task name, so they must be strict
+// alphanumerics (no leading dash, no separators) — prevents task/arg injection. Returns an
+// error string for the offending field, or null if both are valid.
+function validateGmdIds(device: string, gradleModule: string): string | null {
+  const ID_REGEX = /^[A-Za-z][A-Za-z0-9]*$/;
+  if (!ID_REGEX.test(device)) {
+    return `Error: invalid device name '${device}' (must be alphanumeric)`;
+  }
+  if (!ID_REGEX.test(gradleModule)) {
+    return `Error: invalid module name '${gradleModule}' (must be alphanumeric)`;
+  }
+  return null;
+}
+
+interface GmdJobMeta {
+  jobId: string;
+  task: string;
+  device: string;
+  gpu: string;
+  repo: string;
+  startedAt: string;
+}
+
+// Spawn the detached GMD gradle run (under xvfb-run) and register its lifecycle: a timeout that
+// SIGTERMs the run, plus exit/error handlers that finalize the status file. Streams stdout+stderr
+// to the job log (closed exactly once across whichever terminal path fires). Records the job in
+// instrumentedJobs. Throws if the spawn itself fails synchronously (caller surfaces the error).
+function spawnInstrumentedJob(
+  meta: GmdJobMeta,
+  gradle_module: string,
+  env: NodeJS.ProcessEnv,
+): void {
+  const { jobId, task, gpu, repo: resolvedRepo } = meta;
+  const logPath = `${ALLOWED_INSTALL_DIR}/${jobId}.log`;
+  const logFd = openSync(logPath, "a");
+  // Close the log fd exactly once across whichever terminal path fires (exit/error/timeout) — a
+  // second closeSync on a reused fd integer could close an unrelated file.
+  let fdOpen = true;
+  const closeLog = (): void => {
+    if (fdOpen) {
+      fdOpen = false;
+      try {
+        closeSync(logFd);
+      } catch {
+        /* */
+      }
+    }
+  };
+  let proc: ReturnType<typeof spawn>;
+  try {
+    // xvfb-run -a allocates a fresh virtual display WITH an Xauthority cookie and runs gradle under
+    // it; GMD's -gpu host emulator renders into that authed display. (Bare Xvfb without xauth fails.)
+    proc = spawn(
+      "xvfb-run",
+      [
+        "-a",
+        "-s",
+        "-screen 0 1280x800x24",
+        `${resolvedRepo}/gradlew`,
+        task,
+        `-Pandroid.testoptions.manageddevices.emulator.gpu=${gpu}`,
+        "--no-daemon",
+        "--console=plain",
+      ],
+      { cwd: resolvedRepo, env, stdio: ["ignore", logFd, logFd] },
+    );
+  } catch (spawnErr) {
+    closeLog(); // spawn threw synchronously (bad opts/EMFILE) — don't leak the fd
+    throw spawnErr;
+  }
+  const timer = setTimeout(() => {
+    proc.kill("SIGTERM");
+    instrumentedJobs.delete(jobId);
+    closeLog();
+    writeJobStatus(jobId, {
+      ...meta,
+      state: "timeout",
+      endedAt: new Date().toISOString(),
+      note: `killed after ${INSTRUMENTED_TEST_TIMEOUT_MS / 60000}min; a GMD-managed emulator may be orphaned — check android-list-devices`,
+    });
+  }, INSTRUMENTED_TEST_TIMEOUT_MS);
+  proc.on("exit", (code) => {
+    clearTimeout(timer);
+    closeLog();
+    if (!instrumentedJobs.has(jobId)) return; // already finalized (e.g. by the timeout)
+    instrumentedJobs.delete(jobId);
+    writeJobStatus(jobId, {
+      ...meta,
+      state: code === 0 ? "passed" : "failed",
+      exitCode: code,
+      endedAt: new Date().toISOString(),
+      reportDir: `${gradle_module}/build/reports/androidTests/managedDevice/`,
+    });
+  });
+  proc.on("error", (e) => {
+    clearTimeout(timer);
+    closeLog();
+    instrumentedJobs.delete(jobId);
+    writeJobStatus(jobId, {
+      ...meta,
+      state: "error",
+      error: e instanceof Error ? e.message : String(e),
+      endedAt: new Date().toISOString(),
+    });
+  });
+  instrumentedJobs.set(jobId, { proc, timer });
+}
+
+// ── /data/builds listing ───────────────────────────────────
+
+const MAX_LIST_DEPTH = 2;
+
+// Resolve one directory entry to a confined real path + stat, or null if it
+// escapes ALLOWED_INSTALL_DIR / can't be resolved (symlink-escape guard).
+async function resolveBuildsEntry(full: string): Promise<{ real: string; st: Stats } | null> {
+  let real: string;
+  try {
+    real = realpathSync(full);
+  } catch {
+    return null;
+  }
+  if (!real.startsWith(`${ALLOWED_INSTALL_DIR}/`) && real !== ALLOWED_INSTALL_DIR) return null;
+  const st = await stat(full).catch(() => null);
+  if (!st) return null;
+  return { real, st };
+}
+
+// Recursively list ALLOWED_INSTALL_DIR (bounded by MAX_LIST_DEPTH), appending
+// human-readable lines to `out`. Symlink-confined to the builds dir.
+async function listBuildsDir(dir: string, depth: number, out: string[]): Promise<void> {
+  if (depth > MAX_LIST_DEPTH) return;
+  const items = await readdir(dir).catch(() => [] as string[]);
+  for (const item of items) {
+    const full = resolve(dir, item);
+    const resolved = await resolveBuildsEntry(full);
+    if (!resolved) continue;
+    const rel = full.slice(ALLOWED_INSTALL_DIR.length + 1);
+    if (resolved.st.isDirectory()) {
+      out.push(`[dir] ${rel}/`);
+      await listBuildsDir(full, depth + 1, out);
+    } else {
+      const sizeMB = (resolved.st.size / 1_048_576).toFixed(2);
+      out.push(`${rel} (${sizeMB} MB, ${resolved.st.mtime.toISOString()})`);
+    }
+  }
+}
+
+// Best-effort push of a local file to the NUC staging endpoint for Read-tool access.
+// Returns the staged NUC path on success, or null if pushing is unconfigured or fails
+// (callers fall back to reporting the container path). Never throws.
+async function pushScreenshotToNuc(localFile: string): Promise<string | null> {
+  if (!FILE_RECEIVE_URL) return null;
+  try {
+    const buf = await readFile(localFile);
+    const filename = basename(localFile);
+    const url = `${FILE_RECEIVE_URL}?filename=${encodeURIComponent(filename)}`;
+    const res = await fetch(url, {
+      method: "POST",
+      body: buf,
+      headers: { "Content-Type": "application/octet-stream" },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) return null;
+    const result = (await res.json()) as { staged: string; size_bytes: number; local_path: string };
+    return result.local_path;
+  } catch {
+    // Push failed — fall back gracefully
+    return null;
+  }
+}
+
+// Wrap a string in the MCP text-content tool-result shape.
+function textResult(text: string): { content: [{ type: "text"; text: string }] } {
+  return { content: [{ type: "text" as const, text }] };
 }
 
 // ── MCP Server ─────────────────────────────────────────────
@@ -876,30 +1151,7 @@ function createServer(): McpServer {
         }
 
         // Auto-push to NUC for Read tool access
-        let nucPath: string | null = null;
-        if (FILE_RECEIVE_URL) {
-          try {
-            const buf = await readFile(localFile);
-            const filename = basename(localFile);
-            const url = `${FILE_RECEIVE_URL}?filename=${encodeURIComponent(filename)}`;
-            const res = await fetch(url, {
-              method: "POST",
-              body: buf,
-              headers: { "Content-Type": "application/octet-stream" },
-              signal: AbortSignal.timeout(60_000),
-            });
-            if (res.ok) {
-              const result = (await res.json()) as {
-                staged: string;
-                size_bytes: number;
-                local_path: string;
-              };
-              nucPath = result.local_path;
-            }
-          } catch {
-            // Push failed — fall back gracefully
-          }
-        }
+        const nucPath = await pushScreenshotToNuc(localFile);
 
         if (nucPath) {
           return {
@@ -946,37 +1198,17 @@ function createServer(): McpServer {
     async ({ repo_path, task }) => {
       try {
         // Validate repo path against allowlist (realpathSync resolves symlinks)
-        let resolvedRepo: string;
-        try {
-          resolvedRepo = realpathSync(repo_path);
-        } catch {
-          return {
-            content: [
-              { type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` },
-            ],
-          };
-        }
-        if (!isAllowedBuildRepo(resolvedRepo)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}`,
-              },
-            ],
-          };
-        }
-
-        // Redact sensitive values (not entire lines) so error context is preserved.
-        const redact = redactSensitive;
+        const resolved = resolveAllowedRepo(repo_path);
+        if ("error" in resolved) return textResult(resolved.error);
+        const resolvedRepo = resolved.repo;
 
         const isTestTask =
           task === "test" || task === "check" || task.endsWith(":test") || task.endsWith(":check");
 
         // Run gradle. maxBuffer raised — first runs download Gradle + deps and can
         // exceed Node's default 1MB stdout cap (which would surface as a spurious error).
-        let stdout = "",
-          stderr = "";
+        let stdout = "";
+        let stderr = "";
         try {
           const res = await execFile(`${resolvedRepo}/gradlew`, [task], {
             cwd: resolvedRepo,
@@ -986,73 +1218,21 @@ function createServer(): McpServer {
           stdout = res.stdout;
           stderr = res.stderr;
         } catch (runErr: unknown) {
-          // Non-zero gradle exit (failing tests / compile error). Surface stdout+stderr
-          // so the caller sees WHICH tests failed — not just "Command failed".
-          const e = runErr as { stdout?: string; stderr?: string; message?: string };
-          const combined = redact(`${e.stdout || ""}\n${e.stderr || ""}`).trim();
-          const tail = (combined.length > 0 ? combined : redact(e.message || String(runErr))).slice(
-            -4000,
-          );
-          const label = isTestTask ? "Tests failed" : "Build failed";
-          return {
-            content: [
-              { type: "text" as const, text: `${label} (gradle exit non-zero):\n\n${tail}` },
-            ],
-          };
+          return textResult(formatGradleFailure(runErr, isTestTask));
         }
 
         // Test/check tasks produce no APK/AAB — report pass + report locations, skip copy.
         if (isTestTask) {
-          const out = redact(`${stdout}\n${stderr}`).slice(-4000);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Tests passed (${task}).\n\nHTML reports: <module>/build/reports/tests/\nXML results:  <module>/build/test-results/\n\nGradle output (last 4000 chars):\n${out}`,
-              },
-            ],
-          };
+          const out = redactSensitive(`${stdout}\n${stderr}`).slice(-4000);
+          return textResult(
+            `Tests passed (${task}).\n\nHTML reports: <module>/build/reports/tests/\nXML results:  <module>/build/test-results/\n\nGradle output (last 4000 chars):\n${out}`,
+          );
         }
 
-        // Determine output directory based on task (assemble/bundle)
-        const isBundle = task.startsWith("bundle");
-        const variant = task.replace(/^(assemble|bundle)/, "").toLowerCase();
-        const ext = isBundle ? "aab" : "apk";
-        const outputDir = isBundle
-          ? `${resolvedRepo}/app/build/outputs/bundle/${variant}`
-          : `${resolvedRepo}/app/build/outputs/apk/${variant}`;
-
-        // Find and copy output files
-        const copied: string[] = [];
-        try {
-          const files = await readdir(outputDir);
-          for (const f of files) {
-            if (!f.endsWith(`.${ext}`)) continue;
-            const src = realpathSync(resolve(outputDir, f));
-            // Guard: source must be within the repo to prevent symlink escape
-            if (!src.startsWith(`${resolvedRepo}/`)) continue;
-            const dest = `${ALLOWED_INSTALL_DIR}/${f}`;
-            copyFileSync(src, dest);
-            copied.push(dest);
-          }
-        } catch (copyErr: unknown) {
-          // Output dir might not exist for some tasks; log real errors
-          const copyMsg = copyErr instanceof Error ? copyErr.message : "";
-          if (!copyMsg.includes("ENOENT")) {
-            copied.push(`(warning: ${copyMsg.slice(0, 100)})`);
-          }
-        }
-
-        const buildOutput = redact(stderr || stdout).slice(-500);
-        const result =
-          copied.length > 0
-            ? `Build succeeded.\n\nCopied to /data/builds/:\n${copied.map((c) => `- ${c}`).join("\n")}\n\nBuild output (last 500 chars):\n${buildOutput}`
-            : `Build completed but no .${ext} files found in ${outputDir}\n\nBuild output (last 500 chars):\n${buildOutput}`;
-
-        return { content: [{ type: "text" as const, text: result }] };
+        return textResult(await reportAssembleBundle(task, resolvedRepo, stdout, stderr));
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text" as const, text: `Build failed: ${msg.slice(0, 500)}` }] };
+        return textResult(`Build failed: ${msg.slice(0, 500)}`);
       }
     },
   );
@@ -1098,62 +1278,19 @@ function createServer(): McpServer {
     InstrumentedTestInput,
     async ({ repo_path, device, gradle_module, gpu }) => {
       try {
-        // device + module are interpolated into the gradle task name, so they must be strict
-        // alphanumerics (no leading dash, no separators) — prevents task/arg injection.
-        const ID_REGEX = /^[A-Za-z][A-Za-z0-9]*$/;
-        if (!ID_REGEX.test(device)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: invalid device name '${device}' (must be alphanumeric)`,
-              },
-            ],
-          };
-        }
-        if (!ID_REGEX.test(gradle_module)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: invalid module name '${gradle_module}' (must be alphanumeric)`,
-              },
-            ],
-          };
-        }
+        const idError = validateGmdIds(device, gradle_module);
+        if (idError) return textResult(idError);
 
         // Validate repo path against allowlist (realpathSync resolves symlinks on both sides).
-        let resolvedRepo: string;
-        try {
-          resolvedRepo = realpathSync(repo_path);
-        } catch {
-          return {
-            content: [
-              { type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` },
-            ],
-          };
-        }
-        if (!isAllowedBuildRepo(resolvedRepo)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}`,
-              },
-            ],
-          };
-        }
+        const resolved = resolveAllowedRepo(repo_path);
+        if ("error" in resolved) return textResult(resolved.error);
+        const resolvedRepo = resolved.repo;
 
         // One GMD run at a time — concurrent runs would contend on the single shared emulator/AVD/Xvfb/adbkey.
         if (instrumentedJobs.size > 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `A GMD instrumented-test run is already in progress (job ${[...instrumentedJobs.keys()].join(", ")}). Poll android-test-status and retry once it finishes.`,
-              },
-            ],
-          };
+          return textResult(
+            `A GMD instrumented-test run is already in progress (job ${[...instrumentedJobs.keys()].join(", ")}). Poll android-test-status and retry once it finishes.`,
+          );
         }
 
         // Ensure a stable adb key resolvable via $HOME so GMD's adb authorizes the managed emulator
@@ -1161,122 +1298,30 @@ function createServer(): McpServer {
         const adbKeyPath = await ensureAdbKey();
 
         const task = `:${gradle_module}:${device}DebugAndroidTest`;
-        const env: NodeJS.ProcessEnv = {
-          ...emulatorEnv(), // ANDROID_HOME/SDK_ROOT + DISPLAY=:0 + adb-first PATH
-          QT_QPA_PLATFORM: "offscreen", // GMD runs -no-window; avoid the Qt xcb plugin (no libxcb-cursor0)
-          ADB_VENDOR_KEYS: adbKeyPath,
-          // Pin GMD's managed-AVD location explicitly rather than silently relying on inherited quadlet env.
-          ANDROID_AVD_HOME: process.env["ANDROID_AVD_HOME"] || "/srv/android/avd",
-          ANDROID_USER_HOME:
-            process.env["ANDROID_USER_HOME"] ||
-            process.env["ANDROID_AVD_HOME"] ||
-            "/srv/android/avd",
-        };
-        // Run under xvfb-run (below), which provides DISPLAY + a matching Xauthority cookie. Drop the
-        // inherited DISPLAY=:0 (from emulatorEnv): a bare `Xvfb :0` has no xauth, so GMD's -gpu host
-        // emulator fails with "GPU cannot be used for hardware rendering" (validated against the prod SDK).
-        delete env["DISPLAY"];
+        const env = buildGmdEnv(adbKeyPath);
 
         const jobId = randomUUID();
-        const logPath = `${ALLOWED_INSTALL_DIR}/${jobId}.log`;
-        const startedAt = new Date().toISOString();
-        const meta = { jobId, task, device, gpu, repo: resolvedRepo, startedAt };
+        const meta: GmdJobMeta = {
+          jobId,
+          task,
+          device,
+          gpu,
+          repo: resolvedRepo,
+          startedAt: new Date().toISOString(),
+        };
         writeJobStatus(jobId, { ...meta, state: "running" });
 
         // Detached background run; stdout+stderr stream to the job log file (no maxBuffer cap).
         // --console=plain trims the GMD/gradle log volume. The McpServer for this request is discarded
         // after we return, but the child + its exit handler live on the long-lived module scope.
-        const logFd = openSync(logPath, "a");
-        // Close the log fd exactly once across whichever terminal path fires (exit/error/timeout) — a
-        // second closeSync on a reused fd integer could close an unrelated file.
-        let fdOpen = true;
-        const closeLog = (): void => {
-          if (fdOpen) {
-            fdOpen = false;
-            try {
-              closeSync(logFd);
-            } catch {
-              /* */
-            }
-          }
-        };
-        let proc: ReturnType<typeof spawn>;
-        try {
-          // xvfb-run -a allocates a fresh virtual display WITH an Xauthority cookie and runs gradle under
-          // it; GMD's -gpu host emulator renders into that authed display. (Bare Xvfb without xauth fails.)
-          proc = spawn(
-            "xvfb-run",
-            [
-              "-a",
-              "-s",
-              "-screen 0 1280x800x24",
-              `${resolvedRepo}/gradlew`,
-              task,
-              `-Pandroid.testoptions.manageddevices.emulator.gpu=${gpu}`,
-              "--no-daemon",
-              "--console=plain",
-            ],
-            { cwd: resolvedRepo, env, stdio: ["ignore", logFd, logFd] },
-          );
-        } catch (spawnErr) {
-          closeLog(); // spawn threw synchronously (bad opts/EMFILE) — don't leak the fd
-          throw spawnErr;
-        }
-        const timer = setTimeout(() => {
-          proc.kill("SIGTERM");
-          instrumentedJobs.delete(jobId);
-          closeLog();
-          writeJobStatus(jobId, {
-            ...meta,
-            state: "timeout",
-            endedAt: new Date().toISOString(),
-            note: `killed after ${INSTRUMENTED_TEST_TIMEOUT_MS / 60000}min; a GMD-managed emulator may be orphaned — check android-list-devices`,
-          });
-        }, INSTRUMENTED_TEST_TIMEOUT_MS);
-        proc.on("exit", (code) => {
-          clearTimeout(timer);
-          closeLog();
-          if (!instrumentedJobs.has(jobId)) return; // already finalized (e.g. by the timeout)
-          instrumentedJobs.delete(jobId);
-          writeJobStatus(jobId, {
-            ...meta,
-            state: code === 0 ? "passed" : "failed",
-            exitCode: code,
-            endedAt: new Date().toISOString(),
-            reportDir: `${gradle_module}/build/reports/androidTests/managedDevice/`,
-          });
-        });
-        proc.on("error", (e) => {
-          clearTimeout(timer);
-          closeLog();
-          instrumentedJobs.delete(jobId);
-          writeJobStatus(jobId, {
-            ...meta,
-            state: "error",
-            error: e instanceof Error ? e.message : String(e),
-            endedAt: new Date().toISOString(),
-          });
-        });
-        instrumentedJobs.set(jobId, { proc, timer });
+        spawnInstrumentedJob(meta, gradle_module, env);
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Started instrumented-test job ${jobId}\n  ${task} on '${device}', gpu=${gpu}\nPoll: android-test-status job_id="${jobId}"\nStatus/log: ${ALLOWED_INSTALL_DIR}/${jobId}.{status.json,log}`,
-            },
-          ],
-        };
+        return textResult(
+          `Started instrumented-test job ${jobId}\n  ${task} on '${device}', gpu=${gpu}\nPoll: android-test-status job_id="${jobId}"\nStatus/log: ${ALLOWED_INSTALL_DIR}/${jobId}.{status.json,log}`,
+        );
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Failed to start instrumented test: ${msg.slice(0, 500)}`,
-            },
-          ],
-        };
+        return textResult(`Failed to start instrumented test: ${msg.slice(0, 500)}`);
       }
     },
   );
@@ -1348,29 +1393,11 @@ function createServer(): McpServer {
     },
     async ({ repo_path }) => {
       try {
-        let resolved: string;
-        try {
-          resolved = realpathSync(repo_path);
-        } catch {
-          return {
-            content: [
-              { type: "text" as const, text: `Error: repo path does not exist: ${repo_path}` },
-            ],
-          };
-        }
-        if (!isAllowedBuildRepo(resolved)) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error: repo not in allowlist. Allowed: ${ALLOWED_BUILD_REPOS.join(", ")}`,
-              },
-            ],
-          };
-        }
+        const resolved = resolveAllowedRepo(repo_path);
+        if ("error" in resolved) return textResult(resolved.error);
 
         const { stdout, stderr } = await execFile(GIT_PATH, ["pull", "--ff-only"], {
-          cwd: resolved,
+          cwd: resolved.repo,
           timeout: REPO_SYNC_TIMEOUT_MS,
           env: {
             HOME: process.env["HOME"],
@@ -1388,19 +1415,17 @@ function createServer(): McpServer {
           ? "Already up to date."
           : `Updated: ${filesChanged || "changes pulled"}.`;
 
-        return { content: [{ type: "text" as const, text: summary }] };
+        return textResult(summary);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         // Strip remote URLs that may contain credentials
         const safe = msg.replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]").slice(0, 500);
-        return { content: [{ type: "text" as const, text: `Repo sync failed: ${safe}` }] };
+        return textResult(`Repo sync failed: ${safe}`);
       }
     },
   );
 
   // ── Tool: android-list-files ────────────────────────────────
-
-  const MAX_LIST_DEPTH = 2;
 
   server.tool(
     "android-list-files",
@@ -1422,33 +1447,7 @@ function createServer(): McpServer {
         }
 
         const entries: string[] = [];
-        async function listDir(dir: string, depth: number): Promise<void> {
-          if (depth > MAX_LIST_DEPTH) return;
-          const items = await readdir(dir).catch(() => [] as string[]);
-          for (const item of items) {
-            const full = resolve(dir, item);
-            let realFull: string;
-            try {
-              realFull = realpathSync(full);
-            } catch {
-              continue;
-            }
-            if (!realFull.startsWith(`${ALLOWED_INSTALL_DIR}/`) && realFull !== ALLOWED_INSTALL_DIR)
-              continue;
-            const st = await stat(full).catch(() => null);
-            if (!st) continue;
-            const rel = full.slice(ALLOWED_INSTALL_DIR.length + 1);
-            if (st.isDirectory()) {
-              entries.push(`[dir] ${rel}/`);
-              await listDir(full, depth + 1);
-            } else {
-              const sizeMB = (st.size / 1_048_576).toFixed(2);
-              entries.push(`${rel} (${sizeMB} MB, ${st.mtime.toISOString()})`);
-            }
-          }
-        }
-
-        await listDir(base, 0);
+        await listBuildsDir(base, 0, entries);
         if (entries.length === 0)
           return { content: [{ type: "text" as const, text: "No files found." }] };
         return {
@@ -2063,9 +2062,10 @@ const httpServer = Bun.serve({
         return new Response("Rate limit exceeded", { status: 429 });
       }
 
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: undefined, // stateless
-      });
+      // Stateless mode: omit sessionIdGenerator entirely (the SDK disables session
+      // management when it is not provided). With exactOptionalPropertyTypes, passing
+      // `undefined` explicitly is a type error, and omission is the documented contract.
+      const transport = new WebStandardStreamableHTTPServerTransport({});
       const server = createServer();
       await server.connect(transport);
       return transport.handleRequest(req);
