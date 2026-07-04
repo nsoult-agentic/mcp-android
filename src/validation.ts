@@ -40,6 +40,59 @@ export function validateAvdName(name: string): void {
   }
 }
 
+// ── Build-source repo spec + git ref ───────────────────────
+
+// GitHub repo <name> in "<owner>/<name>": alphanumerics + "._-", 1-100 chars,
+// single segment (no "/"), and never "." / ".." — so it is always safe to join
+// under a clone base without path traversal.
+const REPO_NAME_REGEX = /^[A-Za-z0-9_.-]{1,100}$/;
+
+export interface RepoSpec {
+  owner: string;
+  name: string;
+  /** HTTPS clone URL. Auth is supplied by the container's git credential helper — never embedded here. */
+  url: string;
+  /** Single-segment directory name, safe to join under a clone base. */
+  dir: string;
+}
+
+// Parse "<owner>/<name>" into a validated spec. The org guard (owner must equal
+// allowedOwner) is the whole allowlist: the build host — an arbitrary-Gradle RCE
+// surface — only ever fetches from one org, and which repos within it are reachable
+// is decided by what the read credential (GitHub App) was granted (SB #2552, decision 3A).
+export function parseRepoSpec(repo: string, allowedOwner: string): RepoSpec {
+  const parts = repo.trim().split("/");
+  if (parts.length !== 2) {
+    throw new Error(`Repo must be "<owner>/<name>", got: ${repo}`);
+  }
+  const [owner, name] = parts as [string, string];
+  if (owner !== allowedOwner) {
+    throw new Error(`Repo owner must be "${allowedOwner}", got: ${owner}`);
+  }
+  if (name === "." || name === ".." || !REPO_NAME_REGEX.test(name)) {
+    throw new Error(`Invalid repo name: ${name}`);
+  }
+  return { owner, name, url: `https://github.com/${owner}/${name}.git`, dir: name };
+}
+
+// Validate a git ref (branch / tag / commit SHA) for safe use as an execFile arg:
+// must start alphanumeric, then alphanumerics plus "._/-"; no "..", no trailing "/",
+// max 200. Rejects a leading "-" (arg injection) and every ref metachar git forbids
+// (space, ~ ^ : ? * [ \ and control chars) by omission from the whitelist.
+const GIT_REF_REGEX = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+export function validateGitRef(ref: string): void {
+  if (
+    !ref ||
+    ref.length > 200 ||
+    ref.includes("..") ||
+    ref.endsWith("/") ||
+    !GIT_REF_REGEX.test(ref)
+  ) {
+    throw new Error(`Invalid git ref: ${ref}`);
+  }
+}
+
 // Reject path traversal on device paths and confine pulls to an allowlist of prefixes.
 export function validatePullDevicePath(
   devicePath: string,
