@@ -67,10 +67,12 @@ import {
   isRateLimited as isRateLimitedPure,
   parseAdbDevicePorts,
   parseAdbShellCommand,
+  parseRepoSpec,
   pickEmulatorPort as pickEmulatorPortPure,
   redactSensitive,
   validateActivity,
   validateAvdName,
+  validateGitRef,
   validatePackage,
   validatePullDevicePath as validatePullDevicePathPrefixes,
   validateSerial,
@@ -88,9 +90,14 @@ process.umask(0o002);
 const PORT = Number(process.env["PORT"]) || 8912;
 const ADB_PATH = process.env["ADB_PATH"] || "/usr/bin/adb";
 const ALLOWED_INSTALL_DIR = "/data/builds";
-const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/embara-android")
+const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/*")
   .split(",")
   .map((s) => s.trim());
+// android-repo-sync fetches build sources from GitHub. GITHUB_OWNER is the org guard
+// (the only owner it will clone — SB #2552 decision 3A); GIT_CLONE_BASE is where clones
+// land (kept in sync with the BUILD_REPOS allowlist so a freshly-synced repo is buildable).
+const GITHUB_OWNER = process.env["GITHUB_OWNER"] || "soult-io";
+const GIT_CLONE_BASE = process.env["GIT_CLONE_BASE"] || "/home/nsoult/git";
 const ALLOWED_BUILD_TASKS = [
   "assembleDebug",
   "assembleRelease",
@@ -1379,47 +1386,62 @@ function createServer(): McpServer {
   // ── Tool: android-repo-sync ─────────────────────────────────
 
   const GIT_PATH = "/usr/bin/git";
-  const REPO_SYNC_TIMEOUT_MS = 60_000;
+  const GIT_CLONE_TIMEOUT_MS = 1_200_000; // 20 min — a first clone pulls full history over the network
+  const GIT_FETCH_TIMEOUT_MS = 300_000; // 5 min — fetching a ref into an existing clone
+  const GIT_QUICK_TIMEOUT_MS = 15_000; // local-only ops (checkout/clean/rev-parse)
 
   server.tool(
     "android-repo-sync",
-    `Pull latest changes (fast-forward only) on an allowed repo. Allowed repos: ${ALLOWED_BUILD_REPOS.join(", ")}.`,
+    `Fetch ${GITHUB_OWNER}/<name> at a given ref into a clean checkout under ${GIT_CLONE_BASE} and report the resolved commit SHA. Clones on first use; thereafter fetches the ref and force-checks-out + cleans so the working tree exactly matches it — no stale "UP-TO-DATE" false-green builds. Auth is the container's configured git credential helper over HTTPS; only ${GITHUB_OWNER} repos are allowed.`,
     {
-      repo_path: z
+      repo: z
         .string()
         .min(1)
-        .max(200)
-        .describe(`Absolute path to the Android repo (allowed: ${ALLOWED_BUILD_REPOS.join(", ")})`),
+        .max(140)
+        .describe(`Repo as ${GITHUB_OWNER}/<name> (e.g. ${GITHUB_OWNER}/embara-android)`),
+      ref: z.string().min(1).max(200).describe("Branch, tag, or reachable commit SHA to check out"),
     },
-    async ({ repo_path }) => {
+    async ({ repo, ref }) => {
+      const gitEnv = {
+        HOME: process.env["HOME"] ?? "",
+        PATH: process.env["PATH"] ?? "",
+        GIT_TERMINAL_PROMPT: "0",
+      };
+      const runGit = (args: string[], timeout: number) =>
+        execFile(GIT_PATH, args, { timeout, env: gitEnv });
+
       try {
-        const resolved = resolveAllowedRepo(repo_path);
-        if ("error" in resolved) return textResult(resolved.error);
+        const spec = parseRepoSpec(repo, GITHUB_OWNER);
+        validateGitRef(ref);
+        const dir = resolve(GIT_CLONE_BASE, spec.dir);
 
-        const { stdout, stderr } = await execFile(GIT_PATH, ["pull", "--ff-only"], {
-          cwd: resolved.repo,
-          timeout: REPO_SYNC_TIMEOUT_MS,
-          env: {
-            HOME: process.env["HOME"],
-            PATH: process.env["PATH"],
-            GIT_TERMINAL_PROMPT: "0",
-            GIT_SSH_COMMAND:
-              "ssh -i /home/pai/.ssh/nsoult-bot_ed25519 -o UserKnownHostsFile=/home/pai/.ssh/known_hosts",
-          },
-        });
+        // Clone on first use; the credential helper (App token) supplies HTTPS auth.
+        if (!existsSync(resolve(dir, ".git"))) {
+          await runGit(["clone", spec.url, dir], GIT_CLONE_TIMEOUT_MS);
+        }
+        // Fetch the requested ref, then make the tree EXACTLY match it: force-detach at the
+        // fetched commit (discards tracked edits) + clean untracked. Kills the separate-filesystem
+        // stale/false-green trap (SB #2433) and enables building any branch (not ff-only).
+        await runGit(["-C", dir, "fetch", "--prune", "origin", ref], GIT_FETCH_TIMEOUT_MS);
+        await runGit(
+          ["-C", dir, "checkout", "--force", "--detach", "FETCH_HEAD"],
+          GIT_QUICK_TIMEOUT_MS,
+        );
+        await runGit(["-C", dir, "clean", "-fd"], GIT_QUICK_TIMEOUT_MS);
+        const { stdout: sha } = await runGit(
+          ["-C", dir, "rev-parse", "HEAD"],
+          GIT_QUICK_TIMEOUT_MS,
+        );
 
-        const output = `${stdout}\n${stderr}`.trim();
-        const alreadyUpToDate = output.includes("Already up to date");
-        const filesChanged = output.match(/(\d+) files? changed/)?.[0];
-        const summary = alreadyUpToDate
-          ? "Already up to date."
-          : `Updated: ${filesChanged || "changes pulled"}.`;
-
-        return textResult(summary);
+        return textResult(
+          `Synced ${spec.owner}/${spec.name} @ ${ref}\nHEAD ${sha.trim()}\nPath ${dir}`,
+        );
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        // Strip remote URLs that may contain credentials
-        const safe = msg.replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]").slice(0, 500);
+        // Redact secrets + any remote URL that could carry an embedded credential.
+        const safe = redactSensitive(msg)
+          .replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]")
+          .slice(0, 500);
         return textResult(`Repo sync failed: ${safe}`);
       }
     },
