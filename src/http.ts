@@ -52,6 +52,7 @@ import {
   readFileSync,
   chmodSync,
   renameSync,
+  rmSync,
 } from "node:fs";
 import { readdir, stat, readFile, unlink } from "node:fs/promises";
 import type { Stats } from "node:fs";
@@ -70,6 +71,7 @@ import {
   parseRepoSpec,
   pickEmulatorPort as pickEmulatorPortPure,
   redactSensitive,
+  serializeByKey,
   validateActivity,
   validateAvdName,
   validateGitRef,
@@ -98,6 +100,9 @@ const ALLOWED_BUILD_REPOS = (process.env["BUILD_REPOS"] || "/home/nsoult/git/*")
 // land (kept in sync with the BUILD_REPOS allowlist so a freshly-synced repo is buildable).
 const GITHUB_OWNER = process.env["GITHUB_OWNER"] || "soult-io";
 const GIT_CLONE_BASE = process.env["GIT_CLONE_BASE"] || "/home/nsoult/git";
+// Per-checkout-dir serialization for android-repo-sync (keyed by resolved clone dir). Bounded by
+// the number of repos. See serializeByKey.
+const repoSyncChains = new Map<string, Promise<unknown>>();
 const ALLOWED_BUILD_TASKS = [
   "assembleDebug",
   "assembleRelease",
@@ -1420,27 +1425,45 @@ function createServer(): McpServer {
         validateGitRef(ref);
         const dir = resolve(GIT_CLONE_BASE, spec.dir);
 
-        // Clone on first use; the credential helper (App token) supplies HTTPS auth.
-        if (!existsSync(resolve(dir, ".git"))) {
-          await runGit(["clone", spec.url, dir], GIT_CLONE_TIMEOUT_MS);
-        }
-        // Fetch the requested ref, then make the tree EXACTLY match it: force-detach at the
-        // fetched commit (discards tracked edits) + clean untracked. Kills the separate-filesystem
-        // stale/false-green trap (SB #2433) and enables building any branch (not ff-only).
-        await runGit(["-C", dir, "fetch", "--prune", "origin", ref], GIT_FETCH_TIMEOUT_MS);
-        await runGit(
-          ["-C", dir, "checkout", "--force", "--detach", "FETCH_HEAD"],
-          GIT_QUICK_TIMEOUT_MS,
-        );
-        await runGit(["-C", dir, "clean", "-fd"], GIT_QUICK_TIMEOUT_MS);
-        const { stdout: sha } = await runGit(
-          ["-C", dir, "rev-parse", "HEAD"],
-          GIT_QUICK_TIMEOUT_MS,
-        );
+        // A checkout is healthy only if it has a .git that git can resolve AND its origin points
+        // at THIS repo; otherwise it's a partial/corrupt/leftover dir and must be re-cloned.
+        const isHealthyCheckout = async (): Promise<boolean> => {
+          if (!existsSync(resolve(dir, ".git"))) return false;
+          try {
+            await runGit(["-C", dir, "rev-parse", "--git-dir"], GIT_QUICK_TIMEOUT_MS);
+            const origin = await runGit(
+              ["-C", dir, "remote", "get-url", "origin"],
+              GIT_QUICK_TIMEOUT_MS,
+            );
+            return origin.stdout.trim() === spec.url;
+          } catch {
+            return false;
+          }
+        };
 
-        return textResult(
-          `Synced ${spec.owner}/${spec.name} @ ${ref}\nHEAD ${sha.trim()}\nPath ${dir}`,
-        );
+        // (E) Serialize by checkout dir: concurrent fetch/checkout/clean on the SAME tree would
+        // clobber it; different repos still run in parallel.
+        const sha = await serializeByKey(repoSyncChains, dir, async () => {
+          // (F) Self-heal: (re-)clone from scratch when the checkout is missing or unhealthy — a
+          // partial/corrupt/leftover .git — instead of fetching into a broken repo.
+          if (!(await isHealthyCheckout())) {
+            if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+            await runGit(["clone", spec.url, dir], GIT_CLONE_TIMEOUT_MS);
+          }
+          // Fetch the requested ref, then make the tree EXACTLY match it: force-detach at the
+          // fetched commit (discards tracked edits) + clean untracked. Kills the separate-filesystem
+          // stale/false-green trap (SB #2433) and enables building any branch (not ff-only).
+          await runGit(["-C", dir, "fetch", "--prune", "origin", ref], GIT_FETCH_TIMEOUT_MS);
+          await runGit(
+            ["-C", dir, "checkout", "--force", "--detach", "FETCH_HEAD"],
+            GIT_QUICK_TIMEOUT_MS,
+          );
+          await runGit(["-C", dir, "clean", "-fd"], GIT_QUICK_TIMEOUT_MS);
+          const head = await runGit(["-C", dir, "rev-parse", "HEAD"], GIT_QUICK_TIMEOUT_MS);
+          return head.stdout.trim();
+        });
+
+        return textResult(`Synced ${spec.owner}/${spec.name} @ ${ref}\nHEAD ${sha}\nPath ${dir}`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         // Redact secrets + any remote URL that could carry an embedded credential.
