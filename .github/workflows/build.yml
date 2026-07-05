@@ -8,6 +8,7 @@ on:
       - "package.json"
       - "Dockerfile"
       - "tsconfig.json"
+  workflow_dispatch: {} # manual rebuild (e.g. to seed/verify the layer cache)
 
 permissions:
   contents: write
@@ -29,6 +30,9 @@ jobs:
         id: sha
         run: echo "short=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
+      # buildx (docker-container driver) is required for the registry layer cache below.
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/build-push-action@v5
         with:
           context: .
@@ -36,3 +40,9 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/mcp-android:sha-${{ steps.sha.outputs.short }}
             ghcr.io/${{ github.repository_owner }}/mcp-android:latest
+          # Persistent layer cache in ghcr (:buildcache tag) so the big JDK/emulator apt layer keeps
+          # a STABLE digest across builds — FRAME-DESK then pulls it as "already exists" and only the
+          # tiny src/ layer transfers (ghcr's slow per-blob throughput stops mattering). mode=max
+          # caches intermediate layers too. First build after this seeds the cache (one full re-pull).
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/mcp-android:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/mcp-android:buildcache,mode=max
