@@ -351,3 +351,25 @@ export function buildAppJwtSigningInput(appId: string, nowSec: number): string {
   );
   return `${header}.${payload}`;
 }
+
+// ── Async per-key serialization ────────────────────────────
+
+// Run `fn` only after the previous operation for the same `key` has SETTLED, so same-key work
+// never overlaps (different keys run concurrently). The stored tail never rejects, so one failed
+// op doesn't break the chain for the next caller. Callers own `chains` (bounded by distinct keys).
+export function serializeByKey<T>(
+  chains: Map<string, Promise<unknown>>,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = chains.get(key) ?? Promise.resolve();
+  const result = prev.then(fn, fn);
+  chains.set(
+    key,
+    result.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return result;
+}
