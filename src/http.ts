@@ -1406,6 +1406,11 @@ function createServer(): McpServer {
         HOME: process.env["HOME"] ?? "",
         PATH: process.env["PATH"] ?? "",
         GIT_TERMINAL_PROMPT: "0",
+        // Passed through to the git credential helper subprocess (src/git-credential-app.ts), which
+        // mints a short-lived GitHub App installation token for the HTTPS fetch (public + private).
+        GITHUB_APP_ID: process.env["GITHUB_APP_ID"] ?? "",
+        GITHUB_APP_INSTALLATION_ID: process.env["GITHUB_APP_INSTALLATION_ID"] ?? "",
+        GITHUB_APP_KEY_FILE: process.env["GITHUB_APP_KEY_FILE"] ?? "",
       };
       const runGit = (args: string[], timeout: number) =>
         execFile(GIT_PATH, args, { timeout, env: gitEnv });

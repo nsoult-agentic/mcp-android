@@ -320,3 +320,34 @@ export function isRateLimited(
   timestamps.push(now);
   return false;
 }
+
+// ── GitHub App credential helper (build-source fetch auth) ──
+
+// Parse a git credential-helper request (key=value lines; a blank line terminates) into a map.
+// Values may legitimately contain "=", so split on the FIRST "=" only.
+export function parseGitCredentialRequest(input: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of input.split("\n")) {
+    if (line === "") break;
+    const eq = line.indexOf("=");
+    if (eq > 0) out[line.slice(0, eq)] = line.slice(eq + 1);
+  }
+  return out;
+}
+
+// base64url (no padding) — for the JWT segments and the RS256 signature.
+export function base64UrlEncode(input: string | Buffer): string {
+  const buf = typeof input === "string" ? Buffer.from(input, "utf8") : input;
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Build the RS256 JWT signing input "<b64url(header)>.<b64url(payload)>" for a GitHub App.
+// iat is backdated 60s (clock skew); exp is +540s (<10min, GitHub's max). Deterministic given
+// nowSec (so it is unit-testable); the caller applies the RS256 signature over this string.
+export function buildAppJwtSigningInput(appId: string, nowSec: number): string {
+  const header = base64UrlEncode(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const payload = base64UrlEncode(
+    JSON.stringify({ iat: nowSec - 60, exp: nowSec + 540, iss: appId }),
+  );
+  return `${header}.${payload}`;
+}

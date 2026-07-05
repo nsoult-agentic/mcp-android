@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "entry": ["src/http.ts"],
+  "entry": ["src/http.ts", "src/git-credential-app.ts"],
   "project": ["src/**/*.ts"],
   "ignoreUnresolved": ["bun-types"],
   "ignoreBinaries": ["Xvfb"],

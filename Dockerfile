@@ -45,6 +45,10 @@ COPY --from=build /app/node_modules ./node_modules
 COPY package.json ./
 COPY src/ ./src/
 
+# Git credential helper: fetch build sources via a short-lived GitHub App installation token,
+# minted by src/git-credential-app.ts from the GITHUB_APP_* env the quadlet sets (read-only).
+RUN git config --system 'credential.https://github.com.helper' '!bun /app/src/git-credential-app.ts'
+
 # Build output directory for APKs
 RUN mkdir -p /data/builds && chown bun:bun /data/builds
 
