@@ -64,6 +64,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 import {
   ALLOWED_KEYCODES,
+  ALLOWED_SDK_PACKAGE_PREFIXES,
   encodeAdbText,
   isRateLimited as isRateLimitedPure,
   parseAdbDevicePorts,
@@ -77,6 +78,7 @@ import {
   validateGitRef,
   validatePackage,
   validatePullDevicePath as validatePullDevicePathPrefixes,
+  validateSdkPackage,
   validateSerial,
 } from "./validation.js";
 
@@ -103,6 +105,9 @@ const GIT_CLONE_BASE = process.env["GIT_CLONE_BASE"] || "/home/nsoult/git";
 // Per-checkout-dir serialization for android-repo-sync (keyed by resolved clone dir). Bounded by
 // the number of repos. See serializeByKey.
 const repoSyncChains = new Map<string, Promise<unknown>>();
+// Serialize android-sdk-install runs (keyed by SDK root): concurrent sdkmanager processes writing
+// the same SDK contend on its lock and could pile up behind the long install timeout. See serializeByKey.
+const sdkInstallChains = new Map<string, Promise<unknown>>();
 const ALLOWED_BUILD_TASKS = [
   "assembleDebug",
   "assembleRelease",
@@ -129,6 +134,9 @@ const FILE_RECEIVE_URL = process.env["FILE_RECEIVE_URL"] || "http://172.16.10.25
 const ANDROID_HOME = process.env["ANDROID_HOME"] || "/opt/android-sdk";
 const EMULATOR_PATH = `${ANDROID_HOME}/emulator/emulator`;
 const AVDMANAGER_PATH = `${ANDROID_HOME}/cmdline-tools/latest/bin/avdmanager`;
+const SDKMANAGER_PATH = `${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager`;
+// A cold SDK component download (a full platform + build-tools) can take a while.
+const SDK_INSTALL_TIMEOUT_MS = 600_000; // 10 minutes
 const EMULATOR_AVD = process.env["EMULATOR_AVD"] || "mcp_emulator";
 // google_apis (NON-playstore phone): test-keys/userdebug → adb AUTO-AUTHORIZES headless AND it RENDERS,
 // so screenshots actually show the app. By contrast: aosp_atd auto-authorizes but is test-only and
@@ -372,6 +380,65 @@ function emulatorEnv(): NodeJS.ProcessEnv {
     ADB_VENDOR_KEYS: `${process.env["HOME"] || "/srv/android/home"}/.android/adbkey`,
     PATH: `${adbDir}:${process.env["PATH"] || ""}:${ANDROID_HOME}/emulator`,
   };
+}
+
+// Run sdkmanager for a single package, accepting each license prompt non-interactively — there is no
+// TTY, so we feed "y" answers on stdin (execFile can't pipe stdin, hence spawn). Resolves with the
+// exit code + captured output (bounded). sdkmanager writes into $ANDROID_SDK_ROOT. See android-sdk-install.
+function runSdkmanager(pkg: string): Promise<{ code: number | null; output: string }> {
+  const env = { ...process.env, ANDROID_HOME, ANDROID_SDK_ROOT: ANDROID_HOME };
+  return new Promise((resolve, reject) => {
+    const child = spawn(SDKMANAGER_PATH, [pkg], { env });
+    let output = "";
+    const cap = (buf: Buffer) => {
+      output += buf.toString();
+      if (output.length > 200_000) output = output.slice(-200_000);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`sdkmanager timed out after ${SDK_INSTALL_TIMEOUT_MS} ms`));
+    }, SDK_INSTALL_TIMEOUT_MS);
+    child.stdout.on("data", cap);
+    child.stderr.on("data", cap);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, output });
+    });
+    // Swallow EPIPE: if the package is already installed sdkmanager exits without reading stdin.
+    child.stdin.on("error", () => {});
+    try {
+      child.stdin.write("y\n".repeat(50));
+      child.stdin.end();
+    } catch {
+      // stdin already closed — nothing to accept.
+    }
+  });
+}
+
+// Format a finished sdkmanager run into a tool message. A read-only SDK is the EXPECTED failure until
+// a writable overlay is mounted (SB #2568), so detect it and return a crisp, actionable hint rather
+// than dumping sdkmanager's opaque "not writable" stack.
+function formatSdkInstallResult(
+  pkg: string,
+  result: { code: number | null; output: string },
+): string {
+  const tail = redactSensitive(result.output).slice(-4000);
+  if (result.code === 0) {
+    return `Installed SDK package: ${pkg}\n\nsdkmanager output (last 4000 chars):\n${tail}`;
+  }
+  const readOnly = /not writable|read-only file system|failed to (create|write|move|rename)/i.test(
+    result.output,
+  );
+  const hint = readOnly
+    ? `\n\nThe container SDK at ${ANDROID_HOME} is READ-ONLY, so packages can't be installed into it. ` +
+      `A writable SDK — or a platforms/build-tools overlay — must be mounted before self-service ` +
+      `install works (infra, SB #2568). Until then install on the host: sdkmanager '${pkg}'.`
+    : "";
+  return `sdkmanager exited ${result.code} installing ${pkg}.${hint}\n\nOutput (last 4000 chars):\n${tail}`;
 }
 
 // Console ports adb currently knows about (ANY state). This is the ground-truth "did our emulator
@@ -1245,6 +1312,46 @@ function createServer(): McpServer {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         return textResult(`Build failed: ${msg.slice(0, 500)}`);
+      }
+    },
+  );
+
+  // ── Tool: android-sdk-install ──────────────────────────────
+  // Self-service SDK provisioning: run sdkmanager for an allowlisted package TYPE so a compileSdk /
+  // build-tools bump auto-installs instead of failing on a missing host component (SB #2568). Requires
+  // the SDK (or a platforms/build-tools overlay) to be WRITABLE to the container — if it is read-only
+  // the install fails and we surface a crisp, actionable message instead of Gradle's opaque error.
+  server.tool(
+    "android-sdk-install",
+    `Install an Android SDK package on the build host via sdkmanager, accepting licenses non-interactively, so a compileSdk/build-tools bump provisions itself instead of failing on a missing platform. Allowed package types: ${ALLOWED_SDK_PACKAGE_PREFIXES.join(", ")} (e.g. "platforms;android-37.0", "build-tools;35.0.0"). SDK platform packages are minor-versioned: "platforms;android-37.0" exists, plain "android-37" does not.`,
+    {
+      package: z
+        .string()
+        .min(1)
+        .max(120)
+        .describe(
+          `sdkmanager package coordinate (allowed types: ${ALLOWED_SDK_PACKAGE_PREFIXES.join(", ")})`,
+        ),
+    },
+    async ({ package: pkg }) => {
+      try {
+        validateSdkPackage(pkg);
+      } catch (err: unknown) {
+        return textResult(err instanceof Error ? err.message : String(err));
+      }
+      if (!existsSync(SDKMANAGER_PATH)) {
+        return textResult(
+          `sdkmanager not found at ${SDKMANAGER_PATH} — the host SDK cmdline-tools are missing.`,
+        );
+      }
+      try {
+        const result = await serializeByKey(sdkInstallChains, ANDROID_HOME, () =>
+          runSdkmanager(pkg),
+        );
+        return textResult(formatSdkInstallResult(pkg, result));
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return textResult(`Failed to run sdkmanager for ${pkg}: ${msg.slice(0, 500)}`);
       }
     },
   );
