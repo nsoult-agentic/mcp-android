@@ -40,6 +40,40 @@ export function validateAvdName(name: string): void {
   }
 }
 
+// sdkmanager package coordinate for self-service SDK install. Only the package TYPES a build needs
+// to auto-provision are allowed (platforms / build-tools / system-images); every character is
+// constrained to the sdkmanager coordinate charset (letters, digits, ";._-"). Starts alphanumeric
+// so a leading "-" (arg injection) is impossible; "/" is absent so no path traversal. This is an
+// execFile arg (no shell) — the allowlist's job is to keep the tool from being a general
+// "run sdkmanager with anything" primitive on an RCE-adjacent host. Note platform packages are
+// minor-versioned: "platforms;android-37.0" is valid, plain "android-37" is not (that's the caller's
+// concern — sdkmanager rejects unknown coordinates; this only gates the shape).
+export const ALLOWED_SDK_PACKAGE_PREFIXES = [
+  "platforms;",
+  "build-tools;",
+  "system-images;",
+] as const;
+const SDK_PACKAGE_REGEX = /^[A-Za-z0-9][A-Za-z0-9;._-]*$/;
+
+export function validateSdkPackage(pkg: string): void {
+  if (
+    !pkg ||
+    pkg.length > 120 ||
+    pkg.includes("..") ||
+    // JS "$" (no /m flag) also matches just before a single trailing "\n", so a coordinate ending
+    // in a newline would slip the charset regex below — reject newlines explicitly.
+    pkg.includes("\n") ||
+    pkg.includes("\r") ||
+    !SDK_PACKAGE_REGEX.test(pkg) ||
+    !ALLOWED_SDK_PACKAGE_PREFIXES.some((prefix) => pkg.startsWith(prefix))
+  ) {
+    throw new Error(
+      `Invalid or disallowed SDK package: ${pkg} ` +
+        `(allowed types: ${ALLOWED_SDK_PACKAGE_PREFIXES.join(", ")})`,
+    );
+  }
+}
+
 // ── Build-source repo spec + git ref ───────────────────────
 
 // GitHub repo <name> in "<owner>/<name>": alphanumerics + "._-", 1-100 chars,
