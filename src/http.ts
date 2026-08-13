@@ -903,6 +903,9 @@ async function downloadReleaseAsset(
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length > MAX_ASSET_BYTES)
     return { ok: false, message: "Downloaded asset exceeded the 200 MB cap" };
+  // Unlink any existing entry first so the write can't follow a pre-planted symlink out of
+  // /data/builds (defense-in-depth; overwrite semantics for a real prior file are unchanged).
+  rmSync(dest, { force: true });
   writeFileSync(dest, buf);
   return { ok: true, bytes: buf.length };
 }

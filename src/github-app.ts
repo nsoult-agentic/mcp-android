@@ -1,5 +1,5 @@
 /**
- * Mint a short-lived (~9 min) GitHub App installation token for READ access to the App's installed
+ * Mint a short-lived (~1h) GitHub App installation token for READ access to the App's installed
  * repos over the REST API. Shared by the git credential helper (HTTPS fetch of private sources) and
  * android-fetch-release (downloading a signed release asset into /data/builds).
  *
