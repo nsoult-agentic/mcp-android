@@ -12,6 +12,7 @@ import {
   validateAvdName,
   validatePackage,
   validatePullDevicePath,
+  validateReleaseAsset,
   validateSerial,
   xDisplaySocket,
 } from "../src/validation.js";
@@ -103,6 +104,27 @@ describe("validatePullDevicePath", () => {
 
   test("rejects a path outside every allowed prefix", () => {
     expect(() => validatePullDevicePath("/system/bin/sh", prefixes)).toThrow("Pull restricted to");
+  });
+});
+
+describe("validateReleaseAsset", () => {
+  test("accepts a plain .apk/.aab basename", () => {
+    expect(() => validateReleaseAsset("chesspuzzle-release.apk")).not.toThrow();
+    expect(() => validateReleaseAsset("chesspuzzle-release.aab")).not.toThrow();
+    expect(() => validateReleaseAsset("app_v1.2.3-rc.1.apk")).not.toThrow();
+  });
+
+  test("rejects path separators and traversal (confines to /data/builds/)", () => {
+    expect(() => validateReleaseAsset("sub/dir/x.apk")).toThrow("Invalid release asset");
+    expect(() => validateReleaseAsset("../evil.apk")).toThrow("Invalid release asset");
+    expect(() => validateReleaseAsset("/abs/x.apk")).toThrow("Invalid release asset");
+  });
+
+  test("rejects a non-apk/aab extension and a leading dot", () => {
+    expect(() => validateReleaseAsset("payload.sh")).toThrow("Invalid release asset");
+    expect(() => validateReleaseAsset("release.apk.txt")).toThrow("Invalid release asset");
+    expect(() => validateReleaseAsset(".hidden.apk")).toThrow("Invalid release asset");
+    expect(() => validateReleaseAsset("")).toThrow("Invalid release asset");
   });
 });
 

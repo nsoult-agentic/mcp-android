@@ -19,6 +19,7 @@
  *   android-test-status        — Poll an instrumented-test job (state + log tail)
  *   android-list-files         — List files in /data/builds/ (screenshots, APKs)
  *   android-download           — Download file from /data/builds/ as base64
+ *   android-fetch-release      — Download a signed release asset into /data/builds/
  *   android-tap                — Tap at screen coordinates
  *   android-swipe              — Swipe gesture between two points
  *   android-input-text         — Type text into focused input field
@@ -78,9 +79,11 @@ import {
   validateGitRef,
   validatePackage,
   validatePullDevicePath as validatePullDevicePathPrefixes,
+  validateReleaseAsset,
   validateSdkPackage,
   validateSerial,
 } from "./validation.js";
+import { mintInstallationToken } from "./github-app.js";
 
 const execFile = promisify(execFileCb);
 
@@ -845,6 +848,65 @@ function textResult(text: string): { content: [{ type: "text"; text: string }] }
   return { content: [{ type: "text" as const, text }] };
 }
 
+// ── android-fetch-release helpers ──────────────────────────
+// Split out of the tool handler so each stays under the complexity budget. Each returns a discriminated
+// result: `ok` carries the value, otherwise `message` is a caller-safe (secret-free) reason.
+
+const MAX_ASSET_BYTES = 200 * 1_048_576; // 200 MB — well above any app artifact
+
+type ReleaseAsset = { id: number; name: string; size: number };
+
+// Resolve a release by tag and locate the named asset (enforcing the size cap). `base` is the repo's
+// GitHub API URL; `headers` carries the installation token + version/UA.
+async function findReleaseAsset(
+  base: string,
+  headers: Record<string, string>,
+  tag: string,
+  asset: string,
+): Promise<{ ok: true; id: number } | { ok: false; message: string }> {
+  const res = await fetch(`${base}/releases/tags/${encodeURIComponent(tag)}`, {
+    headers: { ...headers, Accept: "application/vnd.github+json" },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok)
+    return { ok: false, message: `Release lookup failed (HTTP ${res.status}) for ${tag}` };
+
+  const rel = (await res.json()) as { assets?: ReleaseAsset[] };
+  const found = rel.assets?.find((a) => a.name === asset);
+  if (!found) {
+    const available = (rel.assets ?? []).map((a) => a.name).join(", ") || "(none)";
+    return { ok: false, message: `Asset '${asset}' not found in ${tag}. Available: ${available}` };
+  }
+  if (found.size > MAX_ASSET_BYTES) {
+    return {
+      ok: false,
+      message: `Asset too large (${(found.size / 1_048_576).toFixed(1)} MB, max 200 MB)`,
+    };
+  }
+  return { ok: true, id: found.id };
+}
+
+// Download an asset by id to `dest`. Accept: octet-stream makes the API 302 to a signed object URL;
+// fetch follows it and (per spec) drops our Authorization header on the cross-origin hop.
+async function downloadReleaseAsset(
+  base: string,
+  headers: Record<string, string>,
+  id: number,
+  dest: string,
+): Promise<{ ok: true; bytes: number } | { ok: false; message: string }> {
+  const res = await fetch(`${base}/releases/assets/${id}`, {
+    headers: { ...headers, Accept: "application/octet-stream" },
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!res.ok) return { ok: false, message: `Asset download failed (HTTP ${res.status})` };
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > MAX_ASSET_BYTES)
+    return { ok: false, message: "Downloaded asset exceeded the 200 MB cap" };
+  writeFileSync(dest, buf);
+  return { ok: true, bytes: buf.length };
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -1578,6 +1640,67 @@ function createServer(): McpServer {
           .replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]")
           .slice(0, 500);
         return textResult(`Repo sync failed: ${safe}`);
+      }
+    },
+  );
+
+  // ── Tool: android-fetch-release ─────────────────────────────
+
+  // Signed release artifacts are produced only by the GitHub-hosted release job (the keystore lives
+  // in CI secrets, never on the build host), so a signed APK/AAB exists only as a GitHub Release
+  // asset. This fetches one into /data/builds/ — authenticated with the container's GitHub App
+  // installation token (same creds as android-repo-sync) — so it can then be android-install'd to a
+  // device (the "Pixel = signed builds" flow). Only ${GITHUB_OWNER} repos; APK/AAB assets only.
+  server.tool(
+    "android-fetch-release",
+    `Download a signed release asset (.apk/.aab) from a ${GITHUB_OWNER} GitHub Release into /data/builds/, using the container's GitHub App credentials, so it can then be installed with android-install. Only ${GITHUB_OWNER} repos.`,
+    {
+      repo: z
+        .string()
+        .min(1)
+        .max(140)
+        .describe(`Repo as ${GITHUB_OWNER}/<name> (e.g. ${GITHUB_OWNER}/chess-puzzle-android)`),
+      tag: z.string().min(1).max(200).describe("Release tag (e.g. v0.4.0)"),
+      asset: z
+        .string()
+        .min(1)
+        .max(100)
+        .describe("Asset filename to download (e.g. chesspuzzle-release.apk)"),
+    },
+    async ({ repo, tag, asset }) => {
+      try {
+        const spec = parseRepoSpec(repo, GITHUB_OWNER);
+        validateGitRef(tag);
+        validateReleaseAsset(asset);
+
+        const dest = resolve(ALLOWED_INSTALL_DIR, asset);
+        if (!dest.startsWith(`${ALLOWED_INSTALL_DIR}/`)) {
+          return textResult("Error: resolved path escapes /data/builds/");
+        }
+
+        const headers = {
+          Authorization: `Bearer ${await mintInstallationToken()}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "mcp-android",
+        };
+        const base = `https://api.github.com/repos/${spec.owner}/${spec.name}`;
+
+        const located = await findReleaseAsset(base, headers, tag, asset);
+        if (!located.ok) return textResult(located.message);
+
+        const dl = await downloadReleaseAsset(base, headers, located.id, dest);
+        if (!dl.ok) return textResult(dl.message);
+
+        return textResult(
+          `Fetched ${asset} (${(dl.bytes / 1_048_576).toFixed(2)} MB) from ${spec.owner}/${spec.name} @ ${tag}\nSaved to ${dest}\nInstall it with android-install.`,
+        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Redact secrets + any URL that could carry an embedded credential.
+        const safe = redactSensitive(msg)
+          .replace(/(?:https?:\/\/|git@)[^\s]+/g, "[url-redacted]")
+          .slice(0, 500);
+        return textResult(`Fetch release failed: ${safe}`);
       }
     },
   );

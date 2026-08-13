@@ -127,6 +127,20 @@ export function validateGitRef(ref: string): void {
   }
 }
 
+// A release asset filename: a plain basename (no path separators) ending in .apk or .aab, so it can
+// only ever land directly inside /data/builds. Rejects traversal and any nested path.
+export function validateReleaseAsset(name: string): void {
+  if (
+    !name ||
+    name.length > 100 ||
+    name.includes("..") ||
+    name.includes("/") ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*\.(apk|aab)$/.test(name)
+  ) {
+    throw new Error(`Invalid release asset name: ${name} (expected a plain .apk/.aab filename)`);
+  }
+}
+
 // Reject path traversal on device paths and confine pulls to an allowlist of prefixes.
 export function validatePullDevicePath(
   devicePath: string,
