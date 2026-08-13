@@ -12,14 +12,10 @@
  * a normal auth failure — so the key and the token never reach git's error path (only a reason on
  * stderr). The token itself is written ONLY to stdout, which git consumes directly.
  */
-import { createSign } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-import {
-  base64UrlEncode,
-  buildAppJwtSigningInput,
-  parseGitCredentialRequest,
-} from "./validation.js";
+import { mintInstallationToken } from "./github-app.js";
+import { parseGitCredentialRequest } from "./validation.js";
 
 async function main(): Promise<void> {
   if (process.argv[2] !== "get") return; // store / erase: nothing to cache
@@ -27,62 +23,18 @@ async function main(): Promise<void> {
   const req = parseGitCredentialRequest(readFileSync(0, "utf8"));
   if (req["host"] !== "github.com") return; // not ours — let git try other helpers
 
-  const appId = process.env["GITHUB_APP_ID"];
-  const installationId = process.env["GITHUB_APP_INSTALLATION_ID"];
-  const keyFile = process.env["GITHUB_APP_KEY_FILE"];
-  if (!appId || !installationId || !keyFile) {
-    process.stderr.write(
-      "git-credential-app: GITHUB_APP_ID / _INSTALLATION_ID / _KEY_FILE not set\n",
-    );
-    return;
-  }
-
-  // Sign an App JWT (RS256) with the private key.
-  let jwt: string;
+  // Mint a short-lived installation token. On ANY failure print no credential (git then surfaces a
+  // normal auth failure); the thrown message carries no secret, only a reason.
+  let token: string;
   try {
-    const signingInput = buildAppJwtSigningInput(appId, Math.floor(Date.now() / 1000));
-    const signer = createSign("RSA-SHA256");
-    signer.update(signingInput);
-    signer.end();
-    jwt = `${signingInput}.${base64UrlEncode(signer.sign(readFileSync(keyFile)))}`;
+    token = await mintInstallationToken();
   } catch (err) {
     process.stderr.write(
-      `git-credential-app: could not sign JWT with ${keyFile}: ${err instanceof Error ? err.message : String(err)}\n`,
+      `git-credential-app: ${err instanceof Error ? err.message : String(err)}\n`,
     );
     return;
   }
-
-  // Exchange the JWT for an installation access token (scoped to the App's installed repos).
-  let res: Response;
-  try {
-    res = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "mcp-android-credential-helper",
-      },
-    });
-  } catch (err) {
-    process.stderr.write(
-      `git-credential-app: installation-token request errored: ${err instanceof Error ? err.message : String(err)}\n`,
-    );
-    return;
-  }
-  if (!res.ok) {
-    process.stderr.write(
-      `git-credential-app: installation-token request failed (HTTP ${res.status})\n`,
-    );
-    return;
-  }
-
-  const body = (await res.json()) as { token?: string };
-  if (!body.token) {
-    process.stderr.write("git-credential-app: installation-token response had no token\n");
-    return;
-  }
-  process.stdout.write(`username=x-access-token\npassword=${body.token}\n`);
+  process.stdout.write(`username=x-access-token\npassword=${token}\n`);
 }
 
 // Fail-safe: ANY unexpected throw (e.g. a non-JSON 2xx body from res.json(), or a stdin read
